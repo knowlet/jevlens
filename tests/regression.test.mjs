@@ -42,3 +42,29 @@ test("the feed row is mounted inside the post text column", () => {
   assert.match(signals, /function mountInto/);
   assert.doesNotMatch(content, /insertAdjacentElement\("afterend", mount\)/);
 });
+
+test("a local fallback is never cached as a Jev result", () => {
+  assert.match(background, /FALLBACK_CACHE_MS/);
+  assert.match(background, /cached\.value\?\.source === "jev_direct"/);
+  assert.match(background, /async function writeCache/);
+});
+
+test("every image gets its own vision session", () => {
+  const offscreen = fs.readFileSync(new URL("../extension/offscreen.js", import.meta.url), "utf8");
+  assert.match(offscreen, /async function createImageSession/);
+  assert.match(offscreen, /baseline\.clone\(\)/);
+  assert.match(offscreen, /session\.destroy\?\.\(\)/);
+  assert.doesNotMatch(offscreen, /if \(visionSession\) return visionSession/);
+});
+
+test("a fresh classification releases stale dim/collapse state", () => {
+  assert.match(content, /function releasePostState/);
+  assert.match(content, /classList\.remove\("jevlens-dim"\)/);
+  assert.match(content, /riskPresentation\(maxRisk, s\)/);
+});
+
+test("the article card reports engagement bait instead of dropping the row", () => {
+  const article = fs.readFileSync(new URL("../extension/article_inject.js", import.meta.url), "utf8");
+  assert.match(article, /const baitBand/);
+  assert.doesNotMatch(article, /r\.labels\?\.engagement_bait/);
+});

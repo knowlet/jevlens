@@ -1,6 +1,11 @@
 importScripts("lib/heuristics.js", "lib/jev.js");
 
-const CLASSIFIER_SCHEMA = "2026-09-social-v3-image";
+const CLASSIFIER_SCHEMA = "2026-09-social-v4-image";
+
+// A local fallback is not a Jev result. Caching one for the full cache window meant that fixing the
+// API key, waiting out a rate limit, or recovering from a timeout still served stale LOCAL output
+// for hours, so fallbacks expire quickly and never satisfy a direct-Jev lookup.
+const FALLBACK_CACHE_MS = 5 * 60 * 1000;
 
 const DEFAULTS = {
   enabled: true,
@@ -104,6 +109,33 @@ async function sha256(value) {
   return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
+async function pruneCacheEntries() {
+  const all = await chrome.storage.local.get(null);
+  const entries = Object.entries(all)
+    .filter(([key]) => key.startsWith("cache:"))
+    .sort((a, b) => Number(a[1]?.at || 0) - Number(b[1]?.at || 0));
+  const drop = entries.slice(0, Math.ceil(entries.length / 2)).map(([key]) => key);
+  if (drop.length) await chrome.storage.local.remove(drop);
+  return drop.length;
+}
+
+async function writeCache(cacheKey, value) {
+  const entry = { at: Date.now(), value };
+  try {
+    await chrome.storage.local.set({ [cacheKey]: entry });
+    return;
+  } catch {
+    // Caching is best effort: a full storage quota must never turn a successful classification into
+    // a reported failure, so drop the oldest half of the cache and retry once.
+  }
+  try {
+    await pruneCacheEntries();
+    await chrome.storage.local.set({ [cacheKey]: entry });
+  } catch {
+    // Still nothing we can do; the classification itself already succeeded.
+  }
+}
+
 async function classify(kind, features) {
   const settings = await getSettings();
   const apiKey = await getApiKey();
@@ -120,7 +152,10 @@ async function classify(kind, features) {
   const cached = (await chrome.storage.local.get(cacheKey))[cacheKey];
   const maxAge = Math.max(0, settings.cacheHours) * 3600_000;
 
-  if (cached && Date.now() - cached.at < maxAge) return { ...cached.value, cached: true };
+  if (cached) {
+    const ttl = cached.value?.source === "jev_direct" ? maxAge : FALLBACK_CACHE_MS;
+    if (Date.now() - cached.at < ttl) return { ...cached.value, cached: true };
+  }
 
   const enriched = await enrichFeatures(kind, features, settings);
   let value;
@@ -137,7 +172,7 @@ async function classify(kind, features) {
   }
 
   if (kind === "social") value.image_evidence = enriched.imageEvidence || null;
-  await chrome.storage.local.set({ [cacheKey]: { at: Date.now(), value } });
+  await writeCache(cacheKey, value);
   return value;
 }
 

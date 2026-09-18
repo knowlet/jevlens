@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  let visionSession = null;
+  let baselineSession = null;
   let visionAvailability = "unknown";
 
   const VISION_OPTIONS = {
@@ -53,16 +53,31 @@
     return visionAvailability;
   }
 
-  async function getVisionSession() {
-    if (visionSession) return visionSession;
+  async function getBaselineSession() {
+    if (baselineSession) return baselineSession;
     const availability = await getVisionAvailability();
     if (availability !== "available") return null;
-    visionSession = await LanguageModel.create({
+    baselineSession = await LanguageModel.create({
       ...VISION_OPTIONS,
       temperature: 0,
       topK: 1
     });
-    return visionSession;
+    return baselineSession;
+  }
+
+  // A Prompt API session keeps its conversation, so one shared session lets the previous image bias
+  // the next classification (an adult graphic scanned before a selfie, for example). Start every
+  // image from an untouched baseline session instead, and throw the per-image session away after.
+  async function createImageSession() {
+    const baseline = await getBaselineSession();
+    if (!baseline) return null;
+    if (typeof baseline.clone === "function") return baseline.clone();
+    try {
+      return await LanguageModel.create({ ...VISION_OPTIONS, temperature: 0, topK: 1 });
+    } catch {
+      // Last resort: reuse the baseline rather than skipping visual evidence entirely.
+      return baseline;
+    }
   }
 
   async function fetchBlob(url) {
@@ -146,7 +161,7 @@
   }
 
   async function visionAnalyze(blob) {
-    const session = await getVisionSession();
+    const session = await createImageSession();
     if (!session) return { status: visionAvailability || "unavailable", result: null };
 
     const prompt = [
@@ -167,6 +182,8 @@
       return { status: "available", result: JSON.parse(raw) };
     } catch (err) {
       return { status: `error:${err?.name || "prompt"}`, result: null, error: String(err?.message || err) };
+    } finally {
+      if (session !== baselineSession) session.destroy?.();
     }
   }
 

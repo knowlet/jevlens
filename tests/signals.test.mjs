@@ -125,6 +125,42 @@ test("political chip only appears for political content and carries the tilt", (
   assert.deepEqual(S.ranked(cleanPost, {}).map(c => c.key), ["ai_farm", "spam", "traffic_manipulation"]);
 });
 
+test("a non-political choice never produces a political chip, even with residual probability", () => {
+  const result = {
+    source: "jev_direct",
+    labels: { political_content: "non_political" },
+    risk: { spam: 0.4, bot_like: 0.3, adult_content: 0.2, adult_promo: 0.1, ai_farm: 0.05, traffic_manipulation: 0.6 },
+    confidence: { political_content: 0.9 },
+    diagnostics: { answer_choices: { politicalContent: { probabilities: { political: 0.18, non_political: 0.78, unclear: 0.04 } } } }
+  };
+  assert.equal(S.politicalLikelihood(result), 0);
+  assert.ok(!S.candidates(result, {}).some(c => c.key === "political"));
+  assert.ok(!S.ranked(result, {}).some(c => c.key === "political"));
+  assert.doesNotMatch(S.describeCandidates(result, {}), /政治/);
+});
+
+test("an unclear political choice is shown as a question with its own probability", () => {
+  const result = {
+    source: "jev_direct",
+    labels: { political_content: "unclear", ideological_tilt: "unclear" },
+    risk: { spam: 0.05, bot_like: 0, adult_content: 0, adult_promo: 0, ai_farm: 0, traffic_manipulation: 0.1 },
+    confidence: { political_content: 0.52 },
+    diagnostics: { answer_choices: { politicalContent: { probabilities: { political: 0.52, non_political: 0.3, unclear: 0.18 } } } }
+  };
+  const top = S.ranked(result, {})[0];
+  assert.equal(top.key, "political");
+  assert.equal(top.label, "政治？");
+  assert.equal(S.pct(top.score), "52%");
+});
+
+test("presentation follows the action mode and releases state it no longer wants", () => {
+  assert.deepEqual(S.riskPresentation(0.9, { threshold: 0.68, actionMode: "dim" }), { risky: true, dim: true, collapse: false });
+  assert.deepEqual(S.riskPresentation(0.9, { threshold: 0.68, actionMode: "collapse" }), { risky: true, dim: false, collapse: true });
+  assert.deepEqual(S.riskPresentation(0.9, { threshold: 0.68, actionMode: "mark" }), { risky: true, dim: false, collapse: false });
+  assert.deepEqual(S.riskPresentation(0.4, { threshold: 0.68, actionMode: "collapse" }), { risky: false, dim: false, collapse: false });
+  assert.deepEqual(S.riskPresentation(0.4, { threshold: 0.3, actionMode: "dim" }), { risky: true, dim: true, collapse: false });
+});
+
 test("a post with no meaningful signal renders one muted chip instead of zeros", () => {
   const flat = {
     source: "local_fallback",

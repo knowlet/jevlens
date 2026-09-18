@@ -1,33 +1,20 @@
+import { casesForProvider, scoreCase } from "./lib/eval-score.mjs";
+
 await import("../extension/lib/heuristics.js");
 await import("../extension/eval-data.js");
 await import("../extension/eval-holdout-data.js");
 
 const H = globalThis.JevLensHeuristics;
 const cases = globalThis.JevLensEvalCases;
-
-function allowed(v) { return Array.isArray(v) ? v : [v]; }
-function score(tc, result) {
-  const checks = [];
-  for (const [field, expected] of Object.entries(tc.expected?.labels || {})) {
-    const actual = result.labels?.[field];
-    checks.push({ field, ok: allowed(expected).includes(actual), actual, expected: allowed(expected) });
-  }
-  for (const [field, rule] of Object.entries(tc.expected?.risk || {})) {
-    const actual = Number(result.risk?.[field]);
-    let ok = Number.isFinite(actual);
-    if (rule.min != null) ok = ok && actual >= Number(rule.min);
-    if (rule.max != null) ok = ok && actual <= Number(rule.max);
-    checks.push({ field: `risk.${field}`, ok, actual, expected: rule });
-  }
-  return checks;
-}
+// Fixtures scoped to another provider (providers: ["jev"]) are skipped here on purpose: they exist
+// to measure the model, and this deterministic baseline must not be tuned to answer them.
+const selected = casesForProvider(cases, "local");
 
 const groups = new Map();
 let failures = 0;
-for (const tc of cases) {
-  if (Array.isArray(tc.providers) && !tc.providers.includes("local")) continue;
+for (const tc of selected) {
   const result = H[tc.kind](tc.features);
-  const checks = score(tc, result);
+  const { checks } = scoreCase(tc, result);
   const split = tc.split || "regression";
   if (!groups.has(split)) groups.set(split, { passed: 0, total: 0, casesPassed: 0, casesTotal: 0 });
   const g = groups.get(split);

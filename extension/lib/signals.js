@@ -72,17 +72,18 @@
     return `${providerName(result)} confidence: ${pct(value)}`;
   }
 
-  // political_content is answered as a choice, so the chip needs P(political) rather than the
-  // top-choice confidence: a confident "non_political" would otherwise outrank real risk signals.
+  // political_content is answered as a choice, so the chip is gated on that choice and scored with
+  // P(political): a confident "non_political" must never produce a political chip, and a confident
+  // "political" must not be outranked by its own top-choice confidence.
   function politicalLikelihood(result) {
+    const label = result?.labels?.political_content;
+    if (label !== "political" && label !== "unclear") return 0;
+
     const probabilities = result?.diagnostics?.answer_choices?.politicalContent?.probabilities;
     const fromModel = Number(probabilities?.political);
     if (Number.isFinite(fromModel)) return clamp01(fromModel);
-
-    const label = result?.labels?.political_content;
     if (label === "political") return clamp01(result?.confidence?.political_content || 0.7);
-    if (label === "unclear") return 0.4;
-    return 0;
+    return 0.4;
   }
 
   const RISK_SIGNALS = [
@@ -107,7 +108,7 @@
 
     return {
       key: "political",
-      label: `政治${tiltSuffix}`,
+      label: `${labelText("political", label)}${tiltSuffix}`,
       score,
       title: [
         `political=${label || "unclear"}`,
@@ -154,6 +155,19 @@
     return candidates(result, settings)
       .map(item => `${item.label} ${pct(item.score)}`)
       .join(" | ");
+  }
+
+  // What a fresh classification asks the caller to do to the post element. Callers must release
+  // these states when this returns false for them: a changed threshold, a changed action mode, or a
+  // changed post must not leave a previously dimmed/collapsed post in that state.
+  function riskPresentation(filterRisk, settings = {}) {
+    const threshold = Number(settings.threshold || 0.68);
+    const risky = (Number(filterRisk) || 0) >= threshold;
+    return {
+      risky,
+      dim: risky && settings.actionMode === "dim",
+      collapse: risky && settings.actionMode === "collapse"
+    };
   }
 
   function chip(text, { title = "", risk = "low", kind = "" } = {}) {
@@ -268,6 +282,7 @@
     candidates,
     ranked,
     describeCandidates,
+    riskPresentation,
     textChip,
     resultChip,
     renderSignalChips,

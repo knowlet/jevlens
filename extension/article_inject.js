@@ -66,6 +66,14 @@
 
   const r = response.result;
   const s = response.settings || {};
+  // Article results carry engagement bait only as a risk score (no label), so state the band and
+  // let the row renderer add the percentage. Without this the row was filtered out and never shown.
+  const baitBand = (value) => {
+    const score = Number(value) || 0;
+    if (score >= 0.66) return "likely";
+    if (score >= 0.33) return "possible";
+    return "unlikely";
+  };
   const rows = [
     ...(s.showPolitical !== false ? [
       ["政治內容", r.labels?.political_content, r.confidence?.political_content],
@@ -73,7 +81,7 @@
     ] : []),
     ...(s.showTraffic !== false ? [
       ["流量/修辭型態", r.labels?.traffic_strategy, r.confidence?.traffic_strategy],
-      ["Engagement bait", r.labels?.engagement_bait || "", r.risk?.engagement_bait]
+      ["Engagement bait", baitBand(r.risk?.engagement_bait), r.risk?.engagement_bait]
     ] : []),
     ...(s.showAiFarm !== false ? [
       ["AI/內容農場", r.labels?.ai_farm, r.risk?.ai_farm]

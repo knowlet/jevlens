@@ -2,7 +2,7 @@
 
 Manifest V3 Chrome extension for annotating articles, X/Twitter posts, and Threads posts with typed **Jev / System One** decisions.
 
-Current version: **0.5.1**.
+Current version: **0.5.2**.
 
 ## Architecture
 
@@ -126,7 +126,7 @@ Jev ✓  貼文  圖 1/1  政治 · 偏右 90%  垃圾 81%  流量操作 55%
 
 Ranking rules:
 
-- 政治 uses P(political) when Jev returns probabilities, otherwise the political choice confidence. It only competes when the content is political or unclear, and folds the descriptive tilt into the same chip (`政治 · 偏右`) instead of spending a second chip on it.
+- 政治 is gated on the model's choice, never on a residual probability: `non_political` gets no chip, `political` renders as `政治` and folds the descriptive tilt into the same chip (`政治 · 偏右`), and `unclear` renders as `政治？`. The score is P(political) when Jev returns probabilities, otherwise the choice confidence.
 - 垃圾 / Bot-like / 成人內容 / 成人推廣 / AI農場 / 流量操作 use their risk score.
 - A category turned off in settings is removed before ranking, so the three slots go to what is still enabled.
 - Scores below 2% are dropped, and a post with no visible signal shows one muted `無明顯訊號` chip instead of a row of zeros.
@@ -178,6 +178,18 @@ Known local holdout misses intentionally remain visible:
 
 These are useful Jev-vs-rule comparisons rather than targets for keyword overfitting.
 
+### Jev release gate
+
+Fixtures scoped to `providers: ["jev"]` are deliberately invisible to the local baseline, because the honest way to check them is to ask the model. That means the real-world coded adult-spam case needs its own gate:
+
+```bash
+TYPESAFE_API_KEY=... npm run eval:jev
+TYPESAFE_API_KEY=... npm run eval:jev -- --all          # every fixture Jev is asked about
+TYPESAFE_API_KEY=... npm run eval:jev -- --split holdout
+```
+
+The default run covers the provider-scoped fixtures and exits non-zero on any failed expectation, so it can gate a release in CI with the key as a secret. `--all` widens it to the whole dataset for a broader accuracy sweep. The key is read from the environment only and is never printed or written to disk.
+
 ## Tests
 
 ```bash
@@ -197,6 +209,7 @@ The current suite covers:
 - evaluation dataset/provider scoping
 - classifier cache schema versioning
 - feed-row category ranking and mount placement (`tests/signals.test.mjs`)
+- local fallbacks staying out of the Jev cache, per-image vision sessions, released dim/collapse state
 
 The feed row is also checked against a real layout engine:
 

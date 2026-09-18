@@ -236,7 +236,8 @@
     confidenceNote,
     textChip,
     renderSignalChips,
-    describeCandidates
+    describeCandidates,
+    riskPresentation
   } = S;
 
   function ensureHud() {
@@ -378,6 +379,7 @@
     show.onclick = () => {
       el.classList.remove("jevlens-collapsed");
       reveal.remove();
+      delete el.dataset.jevlensCollapse;
     };
     reveal.appendChild(show);
 
@@ -393,6 +395,17 @@
 
     el.prepend(reveal);
     el.classList.add("jevlens-collapsed");
+    el.dataset.jevlensCollapse = reason;
+  }
+
+  // Rendering a fresh classification includes clearing the previous one. Without this, a raised
+  // threshold, a switch away from dim/collapse, or a post that stops looking risky keeps the old
+  // styling, and a post unblocked in settings stays hidden because its reveal was inserted earlier.
+  function releasePostState(el) {
+    el.classList.remove("jevlens-dim");
+    el.classList.remove("jevlens-collapsed");
+    el.querySelectorAll(":scope > .jevlens-reveal").forEach(node => node.remove());
+    delete el.dataset.jevlensCollapse;
   }
 
   async function runItem(item) {
@@ -434,10 +447,11 @@
       if (r.source === "jev_direct") stats.jev++;
       else stats.fallback++;
 
-      if (maxRisk >= Number(s.threshold || 0.68)) {
-        if (s.actionMode === "dim") el.classList.add("jevlens-dim");
-        if (s.actionMode === "collapse") collapse(el, `JevLens 摺疊：風險 ${pct(maxRisk)}`, features.handle);
-      }
+      const presentation = riskPresentation(maxRisk, s);
+      // Release first, then apply: the new classification owns the post's presentation state.
+      releasePostState(el);
+      if (presentation.dim) el.classList.add("jevlens-dim");
+      if (presentation.collapse) collapse(el, `JevLens 摺疊：風險 ${pct(maxRisk)}`, features.handle);
     } catch (err) {
       stats.errors++;
       if (mount?.isConnected) {

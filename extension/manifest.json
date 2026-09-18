@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "JevLens — Feed & Article Signals",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Annotate articles and social feeds with typed Jev decisions plus local image evidence: political framing, AI/content-farm patterns, engagement bait, spam, bot-like, adult-content and adult-promo signals.",
   "permissions": [
     "storage",
