@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>JevLens Evaluation</title>
+  <link rel="stylesheet" href="eval.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>JevLens Evaluation</h1>
+        <p>Golden dataset：政治內容、修辭/流量訊號、AI/content farm、垃圾回覆、Bot-like、成人推廣。</p>
+      </div>
+      <a href="options.html">← 設定</a>
+    </header>
+
+    <section class="controls">
+      <label>資料集 <select id="splitFilter"><option value="all">全部</option><option value="regression">Regression</option><option value="holdout">Holdout</option></select></label>
+      <button id="runLocal">跑 Local heuristic</button>
+      <button id="runJev" class="primary">跑 Jev</button>
+      <button id="runBoth">兩者都跑</button>
+      <button id="stop" disabled>停止</button>
+      <button id="download" disabled>下載結果 JSON</button>
+      <span id="status">共 36 個案例</span>
+    </section>
+
+    <section class="explain">
+      <strong>判定原則</strong>
+      <p>這不是單一「品質分數」。政治內容、ideological framing、修辭型態、流量操作、AI/content-farm、spam、bot-like、adult-promo 分開評估。政治傾向只做描述，不作真偽、好壞或投票建議；單篇貼文也不會被直接宣稱為協同操弄。</p>
+    </section>
+
+    <section id="summary" class="summary hidden"></section>
+
+    <section>
+      <div class="table-wrap">
+        <table id="metricsTable">
+          <thead><tr><th>Provider</th><th>Split</th><th>Dimension</th><th>Pass</th><th>Total</th><th>Accuracy</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="table-wrap">
+        <table id="casesTable">
+          <thead>
+            <tr><th>Case</th><th>Provider</th><th>Result</th><th>Expected</th><th>Details</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="eval-data.js"></script>
+  <script src="eval-holdout-data.js"></script>
+  <script src="eval.js"></script>
+</body>
+</html>

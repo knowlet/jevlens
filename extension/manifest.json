@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "JevLens — Feed & Article Signals",
+  "version": "0.5.1",
+  "description": "Annotate articles and social feeds with typed Jev decisions plus local image evidence: political framing, AI/content-farm patterns, engagement bait, spam, bot-like, adult-content and adult-promo signals.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://api.typesafe.ai/*",
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "https://www.threads.net/*",
+    "https://threads.net/*",
+    "https://www.threads.com/*",
+    "https://threads.com/*",
+    "https://pbs.twimg.com/*",
+    "https://video.twimg.com/*",
+    "https://*.cdninstagram.com/*",
+    "https://*.fbcdn.net/*",
+    "https://*.fbsbx.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "JevLens"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*",
+        "https://www.threads.net/*",
+        "https://threads.net/*",
+        "https://www.threads.com/*",
+        "https://threads.com/*"
+      ],
+      "js": [
+        "lib/signals.js",
+        "lib/heuristics.js",
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

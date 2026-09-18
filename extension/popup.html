@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>JevLens</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header><strong>JevLens</strong><span>System One content signals</span></header>
+
+  <label class="switchrow">
+    <span>啟用即時標註</span>
+    <input id="enabled" type="checkbox">
+  </label>
+
+  <button id="analyze">分析目前文章</button>
+  <button id="options">設定</button>
+  <button id="clear">清除快取</button>
+
+  <p id="status"></p>
+  <small>Threads / X 會自動標註；一般文章只在你按「分析目前文章」時讀取頁面文字。</small>
+  <script src="popup.js"></script>
+</body>
+</html>

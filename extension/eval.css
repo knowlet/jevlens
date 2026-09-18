@@ -1,0 +1,45 @@
+:root { color-scheme: light dark; }
+body {
+  margin: 0;
+  background: Canvas;
+  color: CanvasText;
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+main { max-width: 1280px; margin: 28px auto; padding: 0 18px 60px; }
+header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; }
+h1 { margin: 0 0 4px; }
+header p { margin: 0; opacity: .68; }
+header a { color: inherit; }
+section { margin: 18px 0; }
+.controls, .explain, .summary {
+  border: 1px solid color-mix(in srgb, CanvasText 16%, transparent);
+  border-radius: 14px;
+  padding: 14px;
+}
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+button {
+  padding: 8px 12px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+  background: Canvas;
+  color: CanvasText;
+  cursor: pointer;
+}
+button.primary { font-weight: 750; border-width: 2px; }
+button:disabled { opacity: .45; cursor: default; }
+#status { margin-left: auto; opacity: .72; }
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.summary.hidden { display: none; }
+.metric-card { border: 1px solid color-mix(in srgb, CanvasText 12%, transparent); border-radius: 10px; padding: 10px; }
+.metric-card strong { display: block; font-size: 22px; }
+.table-wrap { overflow: auto; border: 1px solid color-mix(in srgb, CanvasText 16%, transparent); border-radius: 12px; }
+table { width: 100%; border-collapse: collapse; min-width: 880px; }
+th, td { padding: 9px 10px; border-bottom: 1px solid color-mix(in srgb, CanvasText 10%, transparent); text-align: left; vertical-align: top; }
+th { position: sticky; top: 0; background: Canvas; z-index: 1; }
+.pass { font-weight: 750; }
+.fail { font-weight: 750; text-decoration: underline dotted; }
+.case-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.tag { border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); border-radius: 999px; padding: 1px 5px; font-size: 11px; opacity: .78; }
+pre { white-space: pre-wrap; word-break: break-word; max-width: 520px; margin: 0; font-size: 11px; }
+details summary { cursor: pointer; }

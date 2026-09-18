@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>JevLens 設定</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <h1>JevLens 設定</h1>
+
+    <section>
+      <h2>TypeSafe Jev</h2>
+      <label>API key
+        <div class="secret-row">
+          <input id="typesafeApiKey" type="password" autocomplete="off" placeholder="貼上 TypeSafe API key">
+          <button id="toggleKey" type="button">顯示</button>
+        </div>
+      </label>
+      <div class="inline-actions">
+        <button id="testJev" type="button">測試 Jev 連線</button>
+        <span id="testStatus"></span>
+      </div>
+      <p class="hint">直接連線：<code>https://api.typesafe.ai/v1/systemone</code>，模型 <code>jev-latest</code>。API key 儲存在 <code>chrome.storage.local</code>，不會同步到 Chrome Sync。</p>
+      <p class="warning">注意：把 API key 存在 Extension 代表它不是機密。能讀取你的 Extension profile / storage 或具備足夠本機權限的程式，都可能取得這把 key。</p>
+      <label><input id="fallbackToLocal" type="checkbox"> Jev 無法連線時使用本機 heuristic fallback</label>
+    </section>
+
+
+    <section>
+      <h2>圖片分析</h2>
+      <label><input id="imageAnalysisEnabled" type="checkbox"> 分析貼文內圖片，將結構化視覺證據交給 Jev</label>
+      <div class="inline-actions">
+        <button id="prepareImageAI" type="button">準備本機圖片模型</button>
+        <span id="imageAiStatus"></span>
+      </div>
+      <p class="hint">圖片先在 Chrome 內用內建多模態 Prompt API 做固定 schema 的視覺特徵抽取；若瀏覽器支援，也會嘗試文字偵測與 QR code。原始圖片不會送到 TypeSafe，Jev 只收到 alt / OCR / 固定視覺 signals。</p>
+      <p class="hint">首次啟用內建模型可能需要額外下載。若你的 Chrome/裝置不支援，JevLens 仍會使用圖片 alt、尺寸、可用的 OCR/QR 與低權重 pixel signals。</p>
+    </section>
+
+    <section>
+      <h2>過濾</h2>
+      <label>高風險閾值 <input id="threshold" type="number" min="0.50" max="0.95" step="0.01"></label>
+      <label>命中後動作
+        <select id="actionMode">
+          <option value="mark">只標註</option>
+          <option value="dim">淡化</option>
+          <option value="collapse">摺疊</option>
+        </select>
+      </label>
+      <label>快取時數 <input id="cacheHours" type="number" min="0" max="168"></label>
+    </section>
+
+    <section>
+      <h2>顯示項目</h2>
+      <label><input id="showPolitical" type="checkbox"> 政治內容 / 傾向</label>
+      <label><input id="showAiFarm" type="checkbox"> AI / 內容農場</label>
+      <label><input id="showTraffic" type="checkbox"> 流量 / 修辭型態</label>
+      <label><input id="showSpam" type="checkbox"> 垃圾回覆</label>
+      <label><input id="showBot" type="checkbox"> Bot-like</label>
+      <label><input id="showAdultContent" type="checkbox"> 成人內容</label>
+      <label><input id="showAdultPromo" type="checkbox"> 成人推廣帳號</label>
+    </section>
+
+    <div class="actions">
+      <button id="save">儲存</button>
+      <button id="removeKey" type="button">移除 API key</button>
+      <span id="status"></span>
+    </div>
+
+
+
+    <section>
+      <h2>評測</h2>
+      <p>用內建 golden dataset 比較 Jev 與本機 heuristic，逐欄檢查政治內容、傾向、修辭、流量操作、AI/content-farm、spam、Bot-like、成人內容與成人推廣。</p>
+      <a class="button-link" href="eval.html" target="_blank" rel="noopener">開啟 Evaluation Runner</a>
+    </section>
+    <section class="caveat">
+      <h2>分類邊界</h2>
+      <p>政治傾向是描述性訊號，不是可信度或價值評分；政治分類只描述可見文字的內容與 framing；「流量操作」只表示可觀察的 click / engagement optimization 訊號。單篇內容無法證明作者動機、協同操弄或內容真假。</p>
+    </section>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>
