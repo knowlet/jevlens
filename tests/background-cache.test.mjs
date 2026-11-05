@@ -6,9 +6,9 @@ import { webcrypto } from "node:crypto";
 
 const source = fs.readFileSync(new URL("../extension/background.js", import.meta.url), "utf8");
 
-function background({ apiKey = "", fallbackToLocal = true, fail = false } = {}) {
+function background({ apiKey = "", fallbackToLocal = true, cacheHours = 24, fail = false } = {}) {
   const local = { typesafeApiKey: apiKey };
-  const settings = { fallbackToLocal };
+  const settings = { fallbackToLocal, cacheHours };
   let now = Date.now();
   let listener;
   let calls = 0;
@@ -105,6 +105,25 @@ test("successful Jev results retain their configured cache window", async () => 
   assert.equal((await app.classify()).result.cached, true);
   assert.equal(app.calls, 1);
   app.advance(24 * 3600 * 1000);
+  assert.equal((await app.classify()).result.cached, undefined);
+  assert.equal(app.calls, 2);
+});
+
+test("zero cache hours disables both local and Jev cache reuse", async () => {
+  for (const apiKey of ["", "synthetic-test-key"]) {
+    const app = background({ apiKey, cacheHours: 0 });
+    await app.classify();
+    assert.equal((await app.classify()).result.cached, undefined);
+    assert.equal(app.calls, 2);
+  }
+});
+
+test("a shorter configured cache window also limits no-key fallbacks", async () => {
+  const app = background({ cacheHours: 1 / 60 });
+  await app.classify();
+  app.advance(59_999);
+  assert.equal((await app.classify()).result.cached, true);
+  app.advance(1);
   assert.equal((await app.classify()).result.cached, undefined);
   assert.equal(app.calls, 2);
 });

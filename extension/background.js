@@ -157,7 +157,7 @@ async function classify(kind, features) {
     // A configured key must get another Jev attempt, and disabling fallback must take effect
     // immediately. Only a no-key request with fallback enabled can reuse a local result.
     const canReuse = isJev || (!apiKey && settings.fallbackToLocal && cached.value?.source === "local_fallback");
-    const ttl = isJev ? maxAge : FALLBACK_CACHE_MS;
+    const ttl = isJev ? maxAge : Math.min(maxAge, FALLBACK_CACHE_MS);
     if (canReuse && Date.now() - cached.at < ttl) return { ...cached.value, cached: true };
   }
 
