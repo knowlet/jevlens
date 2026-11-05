@@ -153,8 +153,12 @@ async function classify(kind, features) {
   const maxAge = Math.max(0, settings.cacheHours) * 3600_000;
 
   if (cached) {
-    const ttl = cached.value?.source === "jev_direct" ? maxAge : FALLBACK_CACHE_MS;
-    if (Date.now() - cached.at < ttl) return { ...cached.value, cached: true };
+    const isJev = cached.value?.source === "jev_direct";
+    // A configured key must get another Jev attempt, and disabling fallback must take effect
+    // immediately. Only a no-key request with fallback enabled can reuse a local result.
+    const canReuse = isJev || (!apiKey && settings.fallbackToLocal && cached.value?.source === "local_fallback");
+    const ttl = isJev ? maxAge : FALLBACK_CACHE_MS;
+    if (canReuse && Date.now() - cached.at < ttl) return { ...cached.value, cached: true };
   }
 
   const enriched = await enrichFeatures(kind, features, settings);
