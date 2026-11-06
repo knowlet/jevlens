@@ -98,8 +98,9 @@
   }
 
   async function pixelSignals(blob) {
+    let bitmap;
     try {
-      const bitmap = await createImageBitmap(blob);
+      bitmap = await createImageBitmap(blob);
       const maxSide = 96;
       const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
       const w = Math.max(1, Math.round(bitmap.width * scale));
@@ -118,45 +119,50 @@
         if (isSkin(r, g, b)) skin++;
         brightness += (r + g + b) / 765;
       }
-      bitmap.close?.();
       return {
         skin_fraction: count ? Number((skin / count).toFixed(3)) : 0,
         mean_brightness: count ? Number((brightness / count).toFixed(3)) : 0
       };
     } catch (err) {
       return { error: String(err?.message || err) };
+    } finally {
+      bitmap?.close?.();
     }
   }
 
   async function detectText(blob) {
     if (!("TextDetector" in globalThis)) return { supported: false, text: "" };
+    let bitmap;
     try {
-      const bitmap = await createImageBitmap(blob);
+      bitmap = await createImageBitmap(blob);
       const detector = new TextDetector();
       const found = await detector.detect(bitmap);
-      bitmap.close?.();
       const text = found.map(item => item.rawValue || item.text || "").filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 1800);
       return { supported: true, text };
     } catch (err) {
       return { supported: true, text: "", error: String(err?.message || err) };
+    } finally {
+      bitmap?.close?.();
     }
   }
 
   async function detectQr(blob) {
     if (!("BarcodeDetector" in globalThis)) return { supported: false, values: [] };
+    let bitmap;
     try {
       const formats = await BarcodeDetector.getSupportedFormats();
       if (!formats.includes("qr_code")) return { supported: true, values: [] };
-      const bitmap = await createImageBitmap(blob);
+      bitmap = await createImageBitmap(blob);
       const detector = new BarcodeDetector({ formats: ["qr_code"] });
       const found = await detector.detect(bitmap);
-      bitmap.close?.();
       return {
         supported: true,
         values: found.map(item => String(item.rawValue || "").slice(0, 600)).filter(Boolean).slice(0, 3)
       };
     } catch (err) {
       return { supported: true, values: [], error: String(err?.message || err) };
+    } finally {
+      bitmap?.close?.();
     }
   }
 
