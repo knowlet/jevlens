@@ -4,6 +4,7 @@
   const S = globalThis.JevLensSignals;
 
   let settingsCache = null;
+  let settingsGeneration = 0;
   const queue = [];
   const queuedKeys = new Set();
   let running = 0;
@@ -26,7 +27,9 @@
 
   async function settings() {
     if (settingsCache) return settingsCache;
+    const generation = settingsGeneration;
     const r = await send({ type: "GET_SETTINGS" });
+    if (generation !== settingsGeneration) return settings();
     settingsCache = r?.settings || {};
     return settingsCache;
   }
@@ -40,10 +43,16 @@
     // Ignore background cache writes; otherwise every classification would trigger a full-feed reanalysis loop.
     if (!syncSettingsChanged && !apiKeyChanged) return;
 
-    settingsCache = null;
+    settingsGeneration++;
+    const disabled = areaName === "sync" && changes.enabled?.newValue === false;
+    settingsCache = disabled ? { enabled: false } : null;
+    queue.length = 0;
+    queuedKeys.clear();
     document.querySelectorAll("[data-jevlens-key]").forEach(el => {
       el.dataset.jevlensDone = "0";
+      if (disabled) clearPost(el);
     });
+    if (disabled) updateHud();
     scheduleScan(0);
   });
 
@@ -257,8 +266,9 @@
     const status = hud.querySelector(".jevlens-hud-status");
     if (!status) return;
     const active = running + queue.length;
-    status.textContent = extra || `已分析 ${stats.analyzed} · 排隊 ${active} · 錯誤 ${stats.errors}`;
-    hud.dataset.state = stats.errors ? "warning" : active ? "working" : "ready";
+    const disabled = settingsCache?.enabled === false;
+    status.textContent = disabled ? "已停用" : extra || `已分析 ${stats.analyzed} · 排隊 ${active} · 錯誤 ${stats.errors}`;
+    hud.dataset.state = disabled ? "ready" : stats.errors ? "warning" : active ? "working" : "ready";
   }
 
   function analysisMount(el, platform, features) {
@@ -408,17 +418,24 @@
     delete el.dataset.jevlensCollapse;
   }
 
+  function clearPost(el) {
+    releasePostState(el);
+    el.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]').forEach(node => node.remove());
+  }
+
   async function runItem(item) {
     running++;
     updateHud();
-    const { el, features, key, mount } = item;
+    const { el, features, key, mount, generation } = item;
+    const isCurrent = () => generation === settingsGeneration && el.isConnected && el.dataset.jevlensKey === key;
 
     try {
-      if (!el.isConnected || el.dataset.jevlensKey !== key) return;
+      if (!isCurrent()) return;
 
       const s = await settings();
+      if (!isCurrent()) return;
       if (!s.enabled) {
-        mount.remove();
+        clearPost(el);
         return;
       }
 
@@ -431,7 +448,7 @@
       setPending(mount);
       const reply = await send({ type: "CLASSIFY", kind: "social", features });
 
-      if (!el.isConnected || el.dataset.jevlensKey !== key) return;
+      if (!isCurrent()) return;
 
       if (!reply?.ok) {
         stats.errors++;
@@ -453,6 +470,7 @@
       if (presentation.dim) el.classList.add("jevlens-dim");
       if (presentation.collapse) collapse(el, `JevLens 摺疊：風險 ${pct(maxRisk)}`, features.handle);
     } catch (err) {
+      if (!isCurrent()) return;
       stats.errors++;
       if (mount?.isConnected) {
         renderError(mount, err?.message || String(err));
@@ -460,7 +478,8 @@
       }
     } finally {
       running--;
-      queuedKeys.delete(key);
+      // An old request must not delete the key owned by a newly queued generation.
+      if (generation === settingsGeneration) queuedKeys.delete(key);
       pump();
       updateHud();
     }
@@ -487,14 +506,17 @@
     setPending(mount, "Jev · 排隊中…");
 
     queuedKeys.add(key);
-    queue.push({ el, features, key, mount });
+    queue.push({ el, features, key, mount, generation: settingsGeneration });
     stats.queued++;
     pump();
   }
 
   async function scan() {
+    const generation = settingsGeneration;
     const s = await settings();
+    if (generation !== settingsGeneration) return;
     if (!s.enabled) {
+      document.querySelectorAll("[data-jevlens-key]").forEach(clearPost);
       updateHud("已停用");
       return;
     }
