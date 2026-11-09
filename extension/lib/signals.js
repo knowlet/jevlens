@@ -247,7 +247,10 @@
     const column = mountColumn(el, textNode);
 
     if (column && textNode && column.contains?.(textNode)) {
-      column.insertBefore(mount, textNode);
+      // insertBefore requires a direct child, not a descendant inside inline wrappers.
+      let reference = textNode;
+      while (reference.parentElement !== column) reference = reference.parentElement;
+      column.insertBefore(mount, reference);
       return "column";
     }
 
