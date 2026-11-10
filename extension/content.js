@@ -441,7 +441,10 @@
 
       const blocked = (s.localBlockedHandles || []).map(x => x.toLowerCase());
       if (features.handle && blocked.includes(features.handle.toLowerCase())) {
+        clearPost(el);
         collapse(el, `JevLens 本機封鎖：${features.handle}`);
+        // This local decision is complete. Keep a manual reveal until the post or settings change.
+        el.dataset.jevlensDone = "1";
         return;
       }
 

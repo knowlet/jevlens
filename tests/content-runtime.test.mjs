@@ -89,7 +89,7 @@ function matches(node, selector) {
   return true;
 }
 
-function fixture({ count = 1, settings = {}, deferSettings = false } = {}) {
+function fixture({ count = 1, settings = {}, deferSettings = false, platform = "x" } = {}) {
   let current = { enabled: true, threshold: 0.68, actionMode: "collapse", ...settings };
   let onChanged;
   let onMutation;
@@ -106,8 +106,8 @@ function fixture({ count = 1, settings = {}, deferSettings = false } = {}) {
   const posts = Array.from({ length: count }, (_, i) => {
     const post = element("article", { "data-testid": "tweet" });
     const column = element("div");
-    column.append(element("span", { "data-testid": "User-Name" }, `@user${i}`));
-    column.append(element("div", { "data-testid": "tweetText" }, `Synthetic post ${i}`));
+    column.append(element(platform === "threads" ? "a" : "span", { "data-testid": "User-Name", ...(platform === "threads" ? { dir: "auto", href: `/@user${i}` } : {}) }, `@user${i}`));
+    column.append(element("div", { "data-testid": "tweetText", ...(platform === "threads" ? { dir: "auto" } : {}) }, `Synthetic post ${i}`));
     post.append(column);
     root.append(post);
     return post;
@@ -120,7 +120,7 @@ function fixture({ count = 1, settings = {}, deferSettings = false } = {}) {
       querySelectorAll: selector => root.querySelectorAll(selector)
     },
     getComputedStyle: () => ({ display: "block" }),
-    location: { hostname: "x.com", href: "https://x.com/home" },
+    location: { hostname: platform === "threads" ? "threads.com" : "x.com", href: `https://${platform === "threads" ? "threads.com" : "x.com"}/home` },
     chrome: {
       runtime: { sendMessage(message, callback) {
         if (message.type === "GET_SETTINGS") {
@@ -287,4 +287,122 @@ test("background cache writes do not discard a valid classification", async () =
   assert.equal(f.messages.length, 1);
   assert.equal(f.posts[0].dataset.jevlensDone, "1");
   assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), true);
+});
+
+function revealPost(post) {
+  // The fixture supports descendant lookup through the reveal node.
+  const show = post.querySelector(".jevlens-reveal").querySelector("button");
+  show.onclick();
+  return show;
+}
+
+test("local-block reveal survives repeated clicks and unchanged rescans", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@USER0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  const show = revealPost(post);
+  show.onclick();
+  for (let i = 0; i < 3; i++) await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.querySelector(".jevlens-reveal"), null);
+  assert.equal(post.querySelector(".jevlens-analysis"), null);
+  assert.equal(post.dataset.jevlensDone, "1");
+  assert.equal(f.messages.length, 0);
+});
+
+test("a real setting change reapplies a local block and allows another reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  f.change({ threshold: 0.8 });
+  await f.scan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  revealPost(post);
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+});
+
+test("removing and restoring a blocklist entry reprocesses the post", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  f.change({ localBlockedHandles: [] });
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  f.reply(0, 0);
+  await settle();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  f.change({ localBlockedHandles: ["@user0"] });
+  await f.scan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), true);
+  revealPost(f.posts[0]);
+  await f.rescan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 1);
+});
+
+test("re-enabling reapplies a revealed local block without classification", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  revealPost(f.posts[0]);
+  f.change({ enabled: false });
+  await f.scan();
+  assertReleased(f.posts[0]);
+  f.change({ enabled: true });
+  await f.scan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), true);
+  revealPost(f.posts[0]);
+  await f.rescan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+});
+
+test("changed content and recycled authors do not inherit a local-block reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  post.querySelector('[data-testid="tweetText"]').textContent = "A different synthetic post";
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 0);
+  revealPost(post);
+  post.querySelector('[data-testid="User-Name"]').textContent = "@other";
+  await f.rescan();
+  assert.equal(f.messages.length, 1);
+  f.reply(0, 0);
+  await settle();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.dataset.jevlensDone, "1");
+});
+
+test("Threads local-block reveal survives rescans and changed text is reprocessed", async () => {
+  const f = fixture({ platform: "threads", settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  await f.rescan();
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  post.querySelector('[data-testid="tweetText"]').textContent = "Changed synthetic Threads post";
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 0);
+});
+
+test("a new local block replaces prior dim styling before manual reveal", async () => {
+  const f = fixture({ settings: { actionMode: "dim" } });
+  await f.scan();
+  f.reply(0);
+  await settle();
+  assert.equal(f.posts[0].classList.contains("jevlens-dim"), true);
+  f.change({ localBlockedHandles: ["@user0"] });
+  await f.scan();
+  revealPost(f.posts[0]);
+  await f.rescan();
+  assert.equal(f.posts[0].classList.contains("jevlens-dim"), false);
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.posts[0].querySelector(".jevlens-analysis"), null);
+  assert.equal(f.messages.length, 1);
 });
