@@ -342,7 +342,14 @@
 
         const raw = await response.text();
         let payload = null;
-        try { payload = raw ? JSON.parse(raw) : {}; } catch { payload = { raw }; }
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          // An HTTP success is not a classification when its JSON is malformed.
+          // Keep error bodies for HTTP diagnostics, but never cache them as Jev output.
+          if (response.ok) throw new Error("TypeSafe returned invalid JSON");
+          payload = raw ? { raw } : {};
+        }
 
         if (response.ok) {
           const normalized = normalize(kind, payload);
