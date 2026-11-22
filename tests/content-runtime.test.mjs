@@ -10,8 +10,14 @@ const signals = fs.readFileSync(new URL("../extension/lib/signals.js", import.me
 // with controllable Chrome replies/timers so interrupted feed analysis is deterministic.
 function element(tag, attributes = {}, value = "") {
   const node = {
-    tagName: tag, attributes, dataset: {}, children: [], parentElement: null,
+    tagName: tag, nodeType: 1, attributes, dataset: {}, children: [], parentElement: null,
     className: "", ownText: value,
+    get childNodes() {
+      const nodes = [];
+      if (this.ownText) nodes.push({ nodeType: 3, nodeValue: this.ownText, textContent: this.ownText });
+      nodes.push(...this.children);
+      return nodes;
+    },
     get isConnected() { return this.root || Boolean(this.parentElement?.isConnected); },
     get textContent() { return this.ownText + this.children.map(child => child.textContent).join(""); },
     set textContent(value) { this.replaceChildren(); this.ownText = value; },
@@ -388,6 +394,69 @@ test("Threads local-block reveal survives rescans and changed text is reprocesse
   post.querySelector('[data-testid="tweetText"]').textContent = "Changed synthetic Threads post";
   await f.rescan();
   assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 0);
+});
+
+function nestQuote(outer) {
+  const nested = element("article", { "data-testid": "tweet" });
+  const column = element("div");
+  column.append(element("span", { "data-testid": "User-Name" }, "@quoted"));
+  column.append(element("div", { "data-testid": "tweetText" }, "Quoted words from an embedded post"));
+  nested.append(column);
+  outer.children[0].append(nested);
+  return nested;
+}
+
+test("blocking an outer post leaves a nested post's pending analysis row", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const outer = f.posts[0];
+  const nested = nestQuote(outer);
+  await f.scan();
+  const rows = [...outer.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]')];
+  assert.equal(rows.length, 1);
+  assert.equal(nested.contains(rows[0]), true);
+  assert.equal(rows[0].dataset.state, "pending");
+  assert.equal(rows[0].dataset.jevlensOwner, nested.dataset.jevlensPost);
+  assert.notEqual(rows[0].dataset.jevlensOwner, outer.dataset.jevlensPost);
+  assert.equal(outer.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].features.handle, "@quoted");
+  f.reply(0, 0);
+  await settle();
+  assert.equal(nested.contains(rows[0]), true);
+  assert.equal(rows[0].dataset.state, "low");
+  assert.equal(nested.classList.contains("jevlens-collapsed"), false);
+  revealPost(outer);
+  await f.rescan();
+  assert.equal(outer.classList.contains("jevlens-collapsed"), false);
+  assert.equal(outer.querySelector(":scope > .jevlens-reveal"), null);
+  assert.equal(nested.contains(rows[0]), true);
+  assert.equal(rows[0].dataset.state, "low");
+  assert.equal(f.messages.length, 1);
+});
+
+test("a manual reveal survives the next scan", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const post = f.posts[0];
+  // No dedicated text node: the card text includes the reveal banner unless extraction ignores it.
+  delete post.querySelector('[data-testid="tweetText"]').attributes["data-testid"];
+  await f.scan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  const keyWhileOpen = post.dataset.jevlensKey;
+  await f.rescan();
+  assert.equal(post.dataset.jevlensKey, keyWhileOpen);
+  revealPost(post);
+  assert.equal(post.dataset.jevlensReveal, keyWhileOpen);
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.querySelector(":scope > .jevlens-reveal"), null);
+  // The scanner has to honor the stored decision even if this version is queued again.
+  post.dataset.jevlensDone = "0";
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.querySelector(":scope > .jevlens-reveal"), null);
+  assert.equal(post.dataset.jevlensReveal, keyWhileOpen);
+  assert.equal(post.dataset.jevlensDone, "1");
   assert.equal(f.messages.length, 0);
 });
 

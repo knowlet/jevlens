@@ -5,6 +5,7 @@
 
   let settingsCache = null;
   let settingsGeneration = 0;
+  let postSerial = 0;
   const queue = [];
   const queuedKeys = new Set();
   let running = 0;
@@ -50,14 +51,45 @@
     queuedKeys.clear();
     document.querySelectorAll("[data-jevlens-key]").forEach(el => {
       el.dataset.jevlensDone = "0";
+      // A settings change is a new decision. A manual reveal does not survive it.
+      delete el.dataset.jevlensReveal;
       if (disabled) clearPost(el);
     });
     if (disabled) updateHud();
     scheduleScan(0);
   });
 
+  function extensionChrome(node) {
+    if (!node || node.nodeType === 3) return false;
+    if (node.id === "jevlens-feed-hud") return true;
+    return Boolean(node.classList?.contains("jevlens-analysis") || node.classList?.contains("jevlens-reveal"));
+  }
+
+  // Post identity has to ignore visibility and our own UI. innerText flips when a collapse hides
+  // the card, and the reveal banner is prepended into the card, so either one makes the next scan
+  // look like a different post and undo a manual reveal.
   function text(el) {
-    return (el?.innerText || el?.textContent || "").replace(/\s+/g, " ").trim();
+    if (!el || extensionChrome(el)) return "";
+    const chunks = [];
+    const blocks = new Set(["ADDRESS", "ARTICLE", "BLOCKQUOTE", "DIV", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "P", "SECTION", "TR"]);
+    const walk = node => {
+      if (!node || extensionChrome(node)) return;
+      if (node.nodeType === 3) {
+        chunks.push(node.nodeValue || "");
+        return;
+      }
+      if (node.nodeType && node.nodeType !== 1) return;
+      const tag = String(node.tagName || "").toUpperCase();
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "SVG") return;
+      if (tag === "BR") {
+        chunks.push("\n");
+        return;
+      }
+      for (const child of node.childNodes || []) walk(child);
+      if (blocks.has(tag)) chunks.push("\n");
+    };
+    walk(el);
+    return chunks.join("").replace(/\s+/g, " ").trim();
   }
 
   function simpleHash(value) {
@@ -82,7 +114,8 @@
 
   function findHandle(root) {
     if (!root) return "";
-    const anchors = [...root.querySelectorAll('a[href^="/"]')];
+    const anchors = [...root.querySelectorAll('a[href^="/"]')]
+      .filter(anchor => !anchor.closest?.(".jevlens-analysis, .jevlens-reveal"));
     for (const a of anchors) {
       const t = text(a);
       if (/^@[\p{L}\p{N}_.]{1,40}$/u.test(t)) return t;
@@ -102,6 +135,7 @@
     // make every feed item look like a reply. Only inspect short author/content text nodes for
     // an explicit relation marker such as “Replying to @foo”.
     const candidates = [...(root?.querySelectorAll?.('[dir="auto"]') || [])]
+      .filter(node => !node.closest?.(".jevlens-analysis, .jevlens-reveal"))
       .map(text)
       .filter(t => t.length > 0 && t.length <= 180)
       .slice(0, 12);
@@ -133,6 +167,7 @@
     };
 
     for (const img of root.querySelectorAll("img")) {
+      if (img.closest?.(".jevlens-analysis, .jevlens-reveal")) continue;
       const rect = img.getBoundingClientRect?.() || { width: 0, height: 0 };
       add(
         img.currentSrc || img.src || "",
@@ -146,6 +181,7 @@
 
     if (out.length < 4) {
       for (const video of root.querySelectorAll("video[poster]")) {
+        if (video.closest?.(".jevlens-analysis, .jevlens-reveal")) continue;
         const rect = video.getBoundingClientRect?.() || { width: 0, height: 0 };
         add(video.poster, video.getAttribute("aria-label") || "video poster", rect.width, rect.height, "video_poster");
         if (out.length >= 4) break;
@@ -271,13 +307,39 @@
     hud.dataset.state = disabled ? "ready" : stats.errors ? "warning" : active ? "working" : "ready";
   }
 
+  function postId(el) {
+    if (!el.dataset.jevlensPost) el.dataset.jevlensPost = String(++postSerial);
+    return el.dataset.jevlensPost;
+  }
+
+  // A quoted or embedded post is a descendant of the outer card and has its own analysis row.
+  // Ownership is recorded on the row so outer cleanup cannot adopt or delete the inner one.
+  function ownAnalysis(el) {
+    const id = el.dataset.jevlensPost;
+    if (!id) return null;
+    for (const node of el.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]')) {
+      if (node.dataset.jevlensOwner === id) return node;
+    }
+    return null;
+  }
+
+  function removeOwnAnalysis(el) {
+    const id = el.dataset.jevlensPost;
+    if (!id) return;
+    for (const node of [...el.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]')]) {
+      if (node.dataset.jevlensOwner === id) node.remove();
+    }
+  }
+
   function analysisMount(el, platform, features) {
-    let mount = el.querySelector(':scope > .jevlens-analysis, .jevlens-analysis[data-owner="jevlens"]');
+    const id = postId(el);
+    let mount = ownAnalysis(el);
     if (mount) return mount;
 
     mount = document.createElement("div");
     mount.className = "jevlens-analysis";
     mount.dataset.owner = "jevlens";
+    mount.dataset.jevlensOwner = id;
     mount.dataset.state = "pending";
     mount.innerHTML = '<span class="jevlens-spinner" aria-hidden="true"></span><span class="jevlens-analysis-text">Jev · 排隊中…</span>';
 
@@ -390,6 +452,8 @@
       el.classList.remove("jevlens-collapsed");
       reveal.remove();
       delete el.dataset.jevlensCollapse;
+      // Persist the revealed post version. The scanner checks this before it collapses again.
+      if (el.dataset.jevlensKey) el.dataset.jevlensReveal = el.dataset.jevlensKey;
     };
     reveal.appendChild(show);
 
@@ -420,7 +484,7 @@
 
   function clearPost(el) {
     releasePostState(el);
-    el.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]').forEach(node => node.remove());
+    removeOwnAnalysis(el);
   }
 
   async function runItem(item) {
@@ -441,9 +505,10 @@
 
       const blocked = (s.localBlockedHandles || []).map(x => x.toLowerCase());
       if (features.handle && blocked.includes(features.handle.toLowerCase())) {
+        const revealed = el.dataset.jevlensReveal === key;
         clearPost(el);
-        collapse(el, `JevLens 本機封鎖：${features.handle}`);
-        // This local decision is complete. Keep a manual reveal until the post or settings change.
+        if (!revealed) collapse(el, `JevLens 本機封鎖：${features.handle}`);
+        // Local block needs no classifier call. A stored reveal stays visible for this post version.
         el.dataset.jevlensDone = "1";
         return;
       }
@@ -468,10 +533,12 @@
       else stats.fallback++;
 
       const presentation = riskPresentation(maxRisk, s);
+      const revealed = el.dataset.jevlensReveal === key;
       // Release first, then apply: the new classification owns the post's presentation state.
+      // A manual reveal of this same post version stays open.
       releasePostState(el);
-      if (presentation.dim) el.classList.add("jevlens-dim");
-      if (presentation.collapse) collapse(el, `JevLens 摺疊：風險 ${pct(maxRisk)}`, features.handle);
+      if (!revealed && presentation.dim) el.classList.add("jevlens-dim");
+      if (!revealed && presentation.collapse) collapse(el, `JevLens 摺疊：風險 ${pct(maxRisk)}`, features.handle);
     } catch (err) {
       if (!isCurrent()) return;
       stats.errors++;
@@ -497,10 +564,17 @@
 
   function enqueue(el, features) {
     const key = featureKey(features);
+    if (el.dataset.jevlensKey && el.dataset.jevlensKey !== key) delete el.dataset.jevlensReveal;
+    // The scanner honors a reveal even when this post is queued again for the same version.
+    if (el.dataset.jevlensReveal === key) {
+      el.dataset.jevlensKey = key;
+      el.dataset.jevlensDone = "1";
+      return;
+    }
     if (el.dataset.jevlensKey === key && ["1", "error"].includes(el.dataset.jevlensDone)) return;
     if (queuedKeys.has(key) && el.dataset.jevlensKey === key) return;
 
-    const old = el.querySelector('.jevlens-analysis[data-owner="jevlens"]');
+    const old = ownAnalysis(el);
     if (old && el.dataset.jevlensKey !== key) old.remove();
 
     el.dataset.jevlensKey = key;
