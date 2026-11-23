@@ -6,6 +6,7 @@
   let settingsCache = null;
   let settingsGeneration = 0;
   let postSerial = 0;
+  let workSerial = 0;
   const queue = [];
   const queuedKeys = new Set();
   // WeakRefs so an infinite feed can drop detached cards. A strong Set would keep every card
@@ -139,19 +140,42 @@
   function pageHidden(node) {
     if (!node || node.nodeType === 3) return false;
     if (node.hidden || node.getAttribute?.("hidden") != null) return true;
-    const inline = String(node.getAttribute?.("style") || "");
-    if (/display\s*:\s*none/i.test(inline) || /visibility\s*:\s*hidden/i.test(inline)) return true;
+    const declared = inlineVisibility(node.getAttribute?.("style"));
     let display = "";
     let visibility = "";
+    let sawComputed = false;
     try {
       const style = globalThis.getComputedStyle?.(node);
-      display = String(style?.display || "");
-      visibility = String(style?.visibility || "");
+      if (style && (style.display || style.visibility)) {
+        display = String(style.display || "");
+        visibility = String(style.visibility || "");
+        sawComputed = true;
+      }
     } catch {
-      return false;
+      sawComputed = false;
+    }
+    // `display:none; display:block` and `--menu-display:none` are visible. Trust computed style,
+    // and only parse inline CSS when the browser cannot provide it.
+    if (!sawComputed) {
+      display = declared.display;
+      visibility = declared.visibility;
     }
     if (visibility === "hidden" || visibility === "collapse") return true;
     return display === "none";
+  }
+
+  function inlineVisibility(styleText) {
+    let display = "";
+    let visibility = "";
+    for (const decl of String(styleText || "").split(";")) {
+      const splitAt = decl.indexOf(":");
+      if (splitAt < 0) continue;
+      const prop = decl.slice(0, splitAt).trim().toLowerCase();
+      const value = decl.slice(splitAt + 1).trim().toLowerCase().split(/\s+/)[0] || "";
+      if (prop === "display") display = value;
+      else if (prop === "visibility") visibility = value;
+    }
+    return { display, visibility };
   }
 
   // text() is also called on a [dir=auto] node directly. Hiding is often on a wrapper, not on
@@ -567,11 +591,14 @@
 
     const show = document.createElement("button");
     show.textContent = "顯示";
+    show.dataset.jevlensGeneration = String(settingsGeneration);
     show.onclick = () => {
+      // The button is from a previous blocklist. A click while settings reload must not record a
+      // reveal, or the next scan treats the card as finished and never classifies it.
+      if (show.dataset.jevlensGeneration !== String(settingsGeneration)) return;
       el.classList.remove("jevlens-collapsed");
       reveal.remove();
       delete el.dataset.jevlensCollapse;
-      // Persist the revealed post version. The scanner checks this before it collapses again.
       if (el.dataset.jevlensKey) el.dataset.jevlensReveal = el.dataset.jevlensKey;
     };
     reveal.appendChild(show);
@@ -609,8 +636,9 @@
   async function runItem(item) {
     running++;
     updateHud();
-    const { el, features, key, mount, generation } = item;
-    const isCurrent = () => generation === settingsGeneration && el.isConnected && el.dataset.jevlensKey === key;
+    const { el, features, key, mount, generation, workId } = item;
+    const ownsCard = () => el.dataset.jevlensWork === workId;
+    const isCurrent = () => generation === settingsGeneration && el.isConnected && el.dataset.jevlensKey === key && ownsCard();
 
     try {
       if (!isCurrent()) return;
@@ -667,8 +695,9 @@
       }
     } finally {
       running--;
-      // An old request must not delete the key owned by a newly queued generation.
-      if (generation === settingsGeneration) queuedKeys.delete(key);
+      // A→B→A reuses the feature key. Only the work item currently stored on the card may render
+      // or retire that pending key; the first A reply is stale once a newer item exists.
+      if (generation === settingsGeneration && ownsCard()) queuedKeys.delete(key);
       pump();
       updateHud();
     }
@@ -688,26 +717,25 @@
       delete el.dataset.jevlensReveal;
       // A recycled card still carries the previous post's 顯示 button until the new decision lands.
       releasePostState(el);
+      queuedKeys.delete(el.dataset.jevlensKey);
     }
-    // The scanner honors a reveal even when this post is queued again for the same version.
-    if (el.dataset.jevlensReveal === key) {
-      el.dataset.jevlensKey = key;
-      el.dataset.jevlensDone = "1";
-      return;
-    }
+    // A reveal is not classification. Done stays whatever the last real decision set, so a stale
+    // 顯示 click cannot mark an unblocked card finished.
     if (el.dataset.jevlensKey === key && ["1", "error"].includes(el.dataset.jevlensDone)) return;
     if (queuedKeys.has(key) && el.dataset.jevlensKey === key) return;
 
     const old = ownAnalysis(el);
     if (old && el.dataset.jevlensKey !== key) old.remove();
 
+    const workId = String(++workSerial);
     el.dataset.jevlensKey = key;
+    el.dataset.jevlensWork = workId;
     el.dataset.jevlensDone = "0";
     const mount = analysisMount(el, features.platform, features);
     setPending(mount, "Jev · 排隊中…");
 
     queuedKeys.add(key);
-    queue.push({ el, features, key, mount, generation: settingsGeneration });
+    queue.push({ el, features, key, mount, generation: settingsGeneration, workId });
     stats.queued++;
     pump();
   }

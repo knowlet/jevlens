@@ -127,17 +127,27 @@ function fixture({ count = 1, settings = {}, deferSettings = false, platform = "
     },
     getComputedStyle: node => {
       const style = String(node?.getAttribute?.("style") || "");
-      const inlineDisplay = style.match(/display\s*:\s*([^;]+)/i)?.[1]?.trim();
-      const inlineVisibility = style.match(/visibility\s*:\s*([^;]+)/i)?.[1]?.trim();
+      if (node?.getAttribute?.("data-no-computed") != null) return {};
+      let display = "";
+      let visibility = "";
+      for (const decl of style.split(";")) {
+        const splitAt = decl.indexOf(":");
+        if (splitAt < 0) continue;
+        const prop = decl.slice(0, splitAt).trim().toLowerCase();
+        const value = decl.slice(splitAt + 1).trim().toLowerCase().split(/\s+/)[0] || "";
+        if (prop === "display") display = value;
+        else if (prop === "visibility") visibility = value;
+      }
       // A site stylesheet, not an inline style. It stays hidden when JevLens suspends its own rule.
       if (node?.classList?.contains("site-hidden")) {
-        return { display: "none", visibility: inlineVisibility || "visible" };
+        return { display: "none", visibility: visibility || "visible" };
       }
-      let display = inlineDisplay || "block";
+      const inlineDisplay = display;
+      let resolved = inlineDisplay || "block";
       const suspended = root.classList.contains("jevlens-suspend-collapse");
       if (!inlineDisplay && !suspended && node?.parentElement?.classList?.contains("jevlens-collapsed")
-        && !node?.classList?.contains("jevlens-reveal")) display = "none";
-      return { display, visibility: inlineVisibility || "visible" };
+        && !node?.classList?.contains("jevlens-reveal")) resolved = "none";
+      return { display: resolved, visibility: visibility || "visible" };
     },
     location: { hostname: platform === "threads" ? "threads.com" : "x.com", href: `https://${platform === "threads" ? "threads.com" : "x.com"}/home` },
     chrome: {
@@ -594,6 +604,66 @@ test("detaching a card without a settings change keeps its reveal", async () => 
   assert.equal(post.dataset.jevlensReveal, revealed);
   assert.equal(post.classList.contains("jevlens-collapsed"), false);
   assert.equal(f.messages.length, 0);
+});
+
+test("a stale reveal click after unblock does not skip classification", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  const show = post.querySelector(".jevlens-reveal").querySelector("button");
+  f.change({ localBlockedHandles: [] });
+  show.onclick();
+  assert.equal(post.dataset.jevlensReveal, undefined);
+  assert.notEqual(post.dataset.jevlensDone, "1");
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  assert.ok(post.querySelector('.jevlens-analysis[data-owner="jevlens"]'));
+  assert.equal(post.dataset.jevlensDone, "0");
+});
+
+test("a recycled card ignores the first reply when the same post returns", async () => {
+  const f = fixture();
+  const post = f.posts[0];
+  const textNode = post.querySelector('[data-testid="tweetText"]');
+  const original = textNode.textContent;
+  await f.scan();
+  textNode.textContent = "Completely different post B text";
+  await f.rescan();
+  textNode.textContent = original;
+  await f.rescan();
+  assert.equal(f.messages.length, 3);
+  const row = post.querySelector('.jevlens-analysis[data-owner="jevlens"]');
+  f.reply(0, 0.95);
+  await settle();
+  assert.notEqual(post.dataset.jevlensDone, "1");
+  assert.equal(row.dataset.state, "pending");
+  assert.equal(post.contains(row), true);
+  f.reply(2, 0.2);
+  await settle();
+  assert.equal(post.dataset.jevlensDone, "1");
+  assert.equal(post.contains(row), true);
+  assert.equal(row.dataset.state, "low");
+});
+
+test("later display values and custom properties stay visible", async () => {
+  for (const [style, phrase] of [
+    ["display:none; display:block", "shown after none and still the visible sentence"],
+    ["--menu-display:none", "custom property text stays on the visible sentence"]
+  ]) {
+    const f = fixture({ platform: "threads" });
+    f.posts[0].append(element("span", { dir: "auto", style }, phrase));
+    await f.scan();
+    assert.equal(f.messages[0].features.text, phrase);
+  }
+  const hidden = fixture({ platform: "threads" });
+  hidden.posts[0].append(element("span", {
+    dir: "auto",
+    style: "display:block; display:none",
+    "data-no-computed": ""
+  }, "really hidden phrase that must not be classified"));
+  await hidden.scan();
+  assert.equal(hidden.messages[0].features.text.includes("really hidden phrase"), false);
+  assert.match(hidden.messages[0].features.text, /Synthetic post 0/);
 });
 
 test("hidden text is not sent to the classifier", async () => {
