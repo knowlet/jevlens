@@ -8,6 +8,9 @@
   let postSerial = 0;
   const queue = [];
   const queuedKeys = new Set();
+  // Feed clients detach cards without dropping the element. A live-document query misses those,
+  // so a later settings toggle would leave their reveal decision in place.
+  const seenPosts = new Set();
   let running = 0;
   const MAX_CONCURRENCY = 4;
   const stats = { discovered: 0, queued: 0, analyzed: 0, errors: 0, jev: 0, fallback: 0 };
@@ -49,9 +52,10 @@
     settingsCache = disabled ? { enabled: false } : null;
     queue.length = 0;
     queuedKeys.clear();
-    document.querySelectorAll("[data-jevlens-key]").forEach(el => {
+    // A settings change is a new decision. A manual reveal does not survive it, including on a
+    // card that is currently detached.
+    visitPosts(el => {
       el.dataset.jevlensDone = "0";
-      // A settings change is a new decision. A manual reveal does not survive it.
       delete el.dataset.jevlensReveal;
       if (disabled) clearPost(el);
     });
@@ -65,22 +69,57 @@
     return Boolean(node.classList?.contains("jevlens-analysis") || node.classList?.contains("jevlens-reveal"));
   }
 
-  // Post identity has to ignore visibility and our own UI. innerText flips when a collapse hides
-  // the card, and the reveal banner is prepended into the card, so either one makes the next scan
-  // look like a different post and undo a manual reveal.
+  function rememberPost(el) {
+    if (el) seenPosts.add(el);
+  }
+
+  function visitPosts(fn) {
+    const seen = new Set();
+    for (const el of document.querySelectorAll("[data-jevlens-key]")) {
+      seen.add(el);
+      fn(el);
+    }
+    for (const el of [...seenPosts]) {
+      if (!seen.has(el)) fn(el);
+      if (!el.isConnected) seenPosts.delete(el);
+    }
+  }
+
+  // Page-hidden copy must not reach the classifier. Text hidden only by our own collapse is still
+  // the post: otherwise the reveal key would change the moment the card folds.
+  function pageHidden(node) {
+    if (!node || node.nodeType === 3) return false;
+    if (node.hidden || node.getAttribute?.("hidden") != null) return true;
+    const inline = String(node.getAttribute?.("style") || "");
+    if (/display\s*:\s*none/i.test(inline) || /visibility\s*:\s*hidden/i.test(inline)) return true;
+    let display = "";
+    let visibility = "";
+    try {
+      const style = globalThis.getComputedStyle?.(node);
+      display = String(style?.display || "");
+      visibility = String(style?.visibility || "");
+    } catch {
+      return false;
+    }
+    if (visibility === "hidden" || visibility === "collapse") return true;
+    if (display !== "none") return false;
+    const parent = node.parentElement;
+    return !(parent?.classList?.contains("jevlens-collapsed") && !node.classList?.contains("jevlens-reveal"));
+  }
+
   function text(el) {
-    if (!el || extensionChrome(el)) return "";
+    if (!el || extensionChrome(el) || pageHidden(el)) return "";
     const chunks = [];
     const blocks = new Set(["ADDRESS", "ARTICLE", "BLOCKQUOTE", "DIV", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "P", "SECTION", "TR"]);
     const walk = node => {
-      if (!node || extensionChrome(node)) return;
+      if (!node || extensionChrome(node) || pageHidden(node)) return;
       if (node.nodeType === 3) {
         chunks.push(node.nodeValue || "");
         return;
       }
       if (node.nodeType && node.nodeType !== 1) return;
       const tag = String(node.tagName || "").toUpperCase();
-      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "SVG") return;
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "SVG" || tag === "TEMPLATE") return;
       if (tag === "BR") {
         chunks.push("\n");
         return;
@@ -102,13 +141,20 @@
   }
 
   function featureKey(features) {
+    // Video layout size changes as metadata arrives. It is not a different post, so it must not
+    // retire a manual reveal. Still images keep their size because a different box can be a different image.
+    const media = (features.images || []).map(img => (
+      img?.kind === "video_poster"
+        ? [img.url || "", img.alt || ""]
+        : [img.url || "", img.alt || "", img.width || 0, img.height || 0]
+    ));
     return simpleHash([
       features.platform || "",
       features.handle || "",
       features.displayName || "",
       features.text || "",
       features.isReply ? "reply" : "post",
-      JSON.stringify((features.images || []).map(img => [img.url || "", img.alt || "", img.width || 0, img.height || 0]))
+      JSON.stringify(media)
     ].join("\u241f"));
   }
 
@@ -564,7 +610,12 @@
 
   function enqueue(el, features) {
     const key = featureKey(features);
-    if (el.dataset.jevlensKey && el.dataset.jevlensKey !== key) delete el.dataset.jevlensReveal;
+    rememberPost(el);
+    if (el.dataset.jevlensKey && el.dataset.jevlensKey !== key) {
+      delete el.dataset.jevlensReveal;
+      // A recycled card still carries the previous post's 顯示 button until the new decision lands.
+      releasePostState(el);
+    }
     // The scanner honors a reveal even when this post is queued again for the same version.
     if (el.dataset.jevlensReveal === key) {
       el.dataset.jevlensKey = key;
@@ -593,7 +644,7 @@
     const s = await settings();
     if (generation !== settingsGeneration) return;
     if (!s.enabled) {
-      document.querySelectorAll("[data-jevlens-key]").forEach(clearPost);
+      visitPosts(clearPost);
       updateHud("已停用");
       return;
     }

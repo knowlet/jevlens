@@ -12,8 +12,8 @@
 //
 // Usage: node scripts/layout-check.mjs            (override the binary with JEVLENS_CHROME)
 
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -200,15 +200,32 @@ ${css}
 <script>
 // Smoke test: content.js must still initialize against lib/signals.js. location.hostname is empty
 // for a file:// page, so the content script scans nothing here; this only proves it loads.
+//
+// Headless --dump-dom does not return until the page's task queue is idle. content.js keeps a
+// repeating URL timer and a document MutationObserver, and the observer schedules another timer
+// every time the script touches the DOM. Virtual time never runs out of work, so Chrome waits
+// forever. The measurements above are already recorded. This block only needs the script to run,
+// so its timers must not stay scheduled.
 (function () {
   var smoke = { loadError: null, api: false, missing: [] };
   window.chrome = {
     runtime: {
       lastError: null,
       getURL: function (value) { return value; },
-      sendMessage: function (message, callback) { if (callback) setTimeout(function () { callback({ ok: false, error: "harness" }); }, 0); }
+      sendMessage: function (message, callback) { if (callback) callback({ ok: false, error: "harness" }); }
     },
     storage: { onChanged: { addListener: function () {} }, sync: { get: function (defaults, callback) { if (callback) callback(defaults); } } }
+  };
+  window.setTimeout = function () { return 0; };
+  window.setInterval = function () { return 0; };
+  window.clearTimeout = function () {};
+  window.clearInterval = function () {};
+  // A live observer plus the URL timer never lets headless Chrome go idle, so --dump-dom never
+  // returns. The geometry above is already measured. This observer only has to accept observe().
+  window.MutationObserver = function () {
+    this.observe = function () {};
+    this.disconnect = function () {};
+    this.takeRecords = function () { return []; };
   };
   try {
     ${content}
@@ -230,19 +247,81 @@ const workdir = mkdtempSync(path.join(tmpdir(), "jevlens-layout-"));
 const page = path.join(workdir, "layout-check.html");
 writeFileSync(page, html);
 
-const dom = execFileSync(chrome, [
-  "--headless=new",
+const chromeArgs = [
+  "--headless=old",
   "--disable-gpu",
   "--no-sandbox",
   "--disable-dev-shm-usage",
   "--no-first-run",
   "--disable-breakpad",
+  "--hide-scrollbars",
+  "--window-size=900,2200"
+];
+
+// Headless Chrome on this host prints --dump-dom / writes --screenshot and then does not exit:
+// the browser process stays up on a DevTools port after the page is done. Stop the process group
+// once the output is complete instead of waiting for that exit.
+function stopChrome(child) {
+  try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+}
+
+function launchChrome(args) {
+  return spawn(chrome, [...chromeArgs, ...args], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+const shot = path.join(workdir, "layout.png");
+const shotProc = launchChrome([
+  `--user-data-dir=${path.join(workdir, "profile-shot")}`,
+  `--screenshot=${shot}`,
+  `file://${page}`
+]);
+const shotDeadline = Date.now() + 20000;
+let lastSize = -1;
+while (Date.now() < shotDeadline) {
+  await new Promise(resolve => setTimeout(resolve, 200));
+  let size = -1;
+  try { size = statSync(shot).size; } catch { size = -1; }
+  if (size > 1000 && size === lastSize) break;
+  lastSize = size;
+}
+stopChrome(shotProc);
+if (lastSize < 1000) {
+  console.error("layout-check: screenshot was not written");
+  process.exit(2);
+}
+const proof = process.env.JEVLENS_LAYOUT_SHOT || "/opt/cursor/artifacts/jevlens-feed-layout.png";
+mkdirSync(path.dirname(proof), { recursive: true });
+copyFileSync(shot, proof);
+
+const domProc = launchChrome([
   `--user-data-dir=${path.join(workdir, "profile")}`,
-  "--window-size=900,1200",
-  "--virtual-time-budget=4000",
   "--dump-dom",
   `file://${page}`
-], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+]);
+let dom = "";
+const domReady = new Promise((resolve, reject) => {
+  const timer = setTimeout(() => {
+    stopChrome(domProc);
+    reject(new Error("layout-check: headless Chrome did not produce a DOM"));
+  }, 20000);
+  domProc.stdout.on("data", chunk => {
+    dom += chunk;
+    if (dom.includes("</html>")) {
+      clearTimeout(timer);
+      stopChrome(domProc);
+      resolve();
+    }
+  });
+  domProc.on("exit", () => {
+    clearTimeout(timer);
+    resolve();
+  });
+  domProc.on("error", error => {
+    clearTimeout(timer);
+    reject(error);
+  });
+});
+await domReady;
 
 const match = dom.match(/<pre id="result">([\s\S]*?)<\/pre>/);
 if (!match || !match[1].trim()) {
@@ -305,4 +384,5 @@ for (const row of results) {
 
 console.log(failures ? `\n${failures} layout check(s) failed` : `\nall ${results.length} scenarios passed`);
 console.log(`fixture: ${page}`);
+console.log(`screenshot: ${proof}`);
 process.exit(failures ? 1 : 0);

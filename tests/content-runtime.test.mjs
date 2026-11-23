@@ -125,7 +125,15 @@ function fixture({ count = 1, settings = {}, deferSettings = false, platform = "
       createElement: tag => element(tag),
       querySelectorAll: selector => root.querySelectorAll(selector)
     },
-    getComputedStyle: () => ({ display: "block" }),
+    getComputedStyle: node => {
+      const style = String(node?.getAttribute?.("style") || "");
+      const inlineDisplay = style.match(/display\s*:\s*([^;]+)/i)?.[1]?.trim();
+      const inlineVisibility = style.match(/visibility\s*:\s*([^;]+)/i)?.[1]?.trim();
+      let display = inlineDisplay || "block";
+      if (!inlineDisplay && node?.parentElement?.classList?.contains("jevlens-collapsed")
+        && !node?.classList?.contains("jevlens-reveal")) display = "none";
+      return { display, visibility: inlineVisibility || "visible" };
+    },
     location: { hostname: platform === "threads" ? "threads.com" : "x.com", href: `https://${platform === "threads" ? "threads.com" : "x.com"}/home` },
     chrome: {
       runtime: { sendMessage(message, callback) {
@@ -149,6 +157,7 @@ function fixture({ count = 1, settings = {}, deferSettings = false, platform = "
     posts, hud, status, messages, pendingSettings,
     async scan() { const fn = nextTimer; nextTimer = null; fn?.(); await settle(); },
     async rescan() { onMutation(); await this.scan(); },
+    attach(post) { root.append(post); },
     change(values, area = "sync") {
       const changes = Object.fromEntries(Object.entries(values).map(([key, value]) =>
         [key, { oldValue: current[key], newValue: value }]));
@@ -433,6 +442,83 @@ test("blocking an outer post leaves a nested post's pending analysis row", async
   assert.equal(nested.contains(rows[0]), true);
   assert.equal(rows[0].dataset.state, "low");
   assert.equal(f.messages.length, 1);
+});
+
+test("a reused card drops the previous reveal button", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  assert.ok(post.querySelector(":scope > .jevlens-reveal"));
+  post.querySelector('[data-testid="User-Name"]').textContent = "@someoneelse";
+  post.querySelector('[data-testid="tweetText"]').textContent = "A recycled card with different words";
+  await f.rescan();
+  assert.equal(post.querySelector(".jevlens-reveal"), null);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.dataset.jevlensReveal, undefined);
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].features.handle, "@someoneelse");
+});
+
+test("a detached card does not stay revealed after a settings toggle", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  const revealed = post.dataset.jevlensReveal;
+  assert.ok(revealed);
+  post.remove();
+  assert.equal(post.isConnected, false);
+  f.change({ threshold: 0.5 });
+  assert.equal(post.dataset.jevlensReveal, undefined);
+  assert.equal(post.dataset.jevlensDone, "0");
+  f.attach(post);
+  await f.scan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.ok(post.querySelector(":scope > .jevlens-reveal"));
+  assert.notEqual(post.dataset.jevlensReveal, revealed);
+});
+
+test("video layout size does not retire a manual reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const post = f.posts[0];
+  const size = { width: 320, height: 180 };
+  const video = element("video", { poster: "https://cdn.example/clip.jpg" });
+  video.poster = "https://cdn.example/clip.jpg";
+  video.getBoundingClientRect = () => ({ width: size.width, height: size.height });
+  post.append(video);
+  await f.scan();
+  revealPost(post);
+  const key = post.dataset.jevlensKey;
+  assert.equal(post.dataset.jevlensReveal, key);
+  size.width = 960;
+  size.height = 540;
+  await f.rescan();
+  assert.equal(post.dataset.jevlensKey, key);
+  assert.equal(post.dataset.jevlensReveal, key);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+  video.poster = "https://cdn.example/other-clip.jpg";
+  video.setAttribute("poster", video.poster);
+  await f.rescan();
+  assert.notEqual(post.dataset.jevlensKey, key);
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+});
+
+test("hidden text is not sent to the classifier", async () => {
+  const f = fixture();
+  const post = f.posts[0];
+  const tweet = post.querySelector('[data-testid="tweetText"]');
+  tweet.append(element("span", { hidden: "" }, "secret hidden phrase"));
+  tweet.append(element("span", { style: "display: none" }, "stylesheet hidden phrase"));
+  tweet.append(element("span", { style: "visibility: hidden" }, "visibility hidden phrase"));
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  const body = f.messages[0].features.text;
+  assert.match(body, /Synthetic post 0/);
+  assert.equal(body.includes("secret hidden phrase"), false);
+  assert.equal(body.includes("stylesheet hidden phrase"), false);
+  assert.equal(body.includes("visibility hidden phrase"), false);
 });
 
 test("a manual reveal survives the next scan", async () => {
