@@ -8,9 +8,10 @@
   let postSerial = 0;
   const queue = [];
   const queuedKeys = new Set();
-  // Feed clients detach cards without dropping the element. A live-document query misses those,
-  // so a later settings toggle would leave their reveal decision in place.
-  const seenPosts = new Set();
+  // WeakRefs so an infinite feed can drop detached cards. A strong Set would keep every card
+  // alive until the next settings change. Dead refs are pruned on each scan; a card the page
+  // still holds stays reachable for that toggle.
+  const seenPosts = [];
   let running = 0;
   const MAX_CONCURRENCY = 4;
   const stats = { discovered: 0, queued: 0, analyzed: 0, errors: 0, jev: 0, fallback: 0 };
@@ -70,18 +71,48 @@
   }
 
   function rememberPost(el) {
-    if (el) seenPosts.add(el);
+    if (!el) return;
+    for (const ref of seenPosts) {
+      if (ref.deref() === el) return;
+    }
+    seenPosts.push(new WeakRef(el));
+  }
+
+  function pruneSeenPosts() {
+    const next = [];
+    const live = new Set();
+    for (const ref of seenPosts) {
+      const el = ref.deref();
+      if (!el || live.has(el)) continue;
+      live.add(el);
+      next.push(ref);
+    }
+    seenPosts.length = 0;
+    seenPosts.push(...next);
   }
 
   function visitPosts(fn) {
+    pruneSeenPosts();
     const seen = new Set();
     for (const el of document.querySelectorAll("[data-jevlens-key]")) {
       seen.add(el);
       fn(el);
     }
-    for (const el of [...seenPosts]) {
-      if (!seen.has(el)) fn(el);
-      if (!el.isConnected) seenPosts.delete(el);
+    const next = [];
+    for (const ref of seenPosts) {
+      const el = ref.deref();
+      if (!el || seen.has(el)) continue;
+      fn(el);
+      if (el.isConnected) next.push(ref);
+    }
+    for (const el of seen) next.push(new WeakRef(el));
+    seenPosts.length = 0;
+    const kept = new Set();
+    for (const ref of next) {
+      const el = ref.deref();
+      if (!el || kept.has(el)) continue;
+      kept.add(el);
+      seenPosts.push(ref);
     }
   }
 
@@ -107,12 +138,21 @@
     return !(parent?.classList?.contains("jevlens-collapsed") && !node.classList?.contains("jevlens-reveal"));
   }
 
+  // text() is also called on a [dir=auto] node directly. Hiding is often on a wrapper, not on
+  // that span, so the check has to walk ancestors. Our own collapse is exempt inside pageHidden.
+  function concealed(node) {
+    for (let current = node; current; current = current.parentElement) {
+      if (extensionChrome(current) || pageHidden(current)) return true;
+    }
+    return false;
+  }
+
   function text(el) {
-    if (!el || extensionChrome(el) || pageHidden(el)) return "";
+    if (!el || concealed(el)) return "";
     const chunks = [];
     const blocks = new Set(["ADDRESS", "ARTICLE", "BLOCKQUOTE", "DIV", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "P", "SECTION", "TR"]);
     const walk = node => {
-      if (!node || extensionChrome(node) || pageHidden(node)) return;
+      if (!node || concealed(node)) return;
       if (node.nodeType === 3) {
         chunks.push(node.nodeValue || "");
         return;
@@ -140,9 +180,15 @@
     return (h >>> 0).toString(36);
   }
 
+  function permalinkId(url) {
+    const match = String(url || "").match(/\/(?:status|post)\/([^/?#]+)/i);
+    return match?.[1] || "";
+  }
+
   function featureKey(features) {
     // Video layout size changes as metadata arrives. It is not a different post, so it must not
     // retire a manual reveal. Still images keep their size because a different box can be a different image.
+    // The status id distinguishes two posts that share a card, author, and text.
     const media = (features.images || []).map(img => (
       img?.kind === "video_poster"
         ? [img.url || "", img.alt || ""]
@@ -154,8 +200,14 @@
       features.displayName || "",
       features.text || "",
       features.isReply ? "reply" : "post",
+      permalinkId(features.postUrl),
       JSON.stringify(media)
     ].join("\u241f"));
+  }
+
+  function rawHref(link) {
+    if (!link) return "";
+    return link.getAttribute?.("href") || link.href || "";
   }
 
   function findHandle(root) {
@@ -248,7 +300,7 @@
       displayName: text(userName).split("@")[0].trim().slice(0, 100),
       // A /status/ page can contain both the root post and replies, so URL alone is not a reply signal.
       isReply: explicitReplySignal(article),
-      postUrl: link?.href || "",
+      postUrl: rawHref(link),
       images: extractMedia(article)
     };
   }
@@ -272,7 +324,7 @@
       displayName: candidates.find(t => t.length < 80 && !t.startsWith("@")) || "",
       // Threads permalink pages also contain the root post; do not treat the whole page as a reply.
       isReply: explicitReplySignal(article),
-      postUrl: postLink?.href || "",
+      postUrl: rawHref(postLink),
       images: extractMedia(article)
     };
   }
@@ -640,6 +692,7 @@
   }
 
   async function scan() {
+    pruneSeenPosts();
     const generation = settingsGeneration;
     const s = await settings();
     if (generation !== settingsGeneration) return;

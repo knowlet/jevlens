@@ -505,6 +505,52 @@ test("video layout size does not retire a manual reveal", async () => {
   assert.equal(post.classList.contains("jevlens-collapsed"), true);
 });
 
+test("a Threads dir=auto span inside a hidden wrapper is not classified", async () => {
+  const f = fixture({ platform: "threads" });
+  const post = f.posts[0];
+  const hidden = element("div", { style: "display: none" });
+  hidden.append(element("span", { dir: "auto" }, "Hidden wrapper sentence that is longer than the visible post"));
+  post.append(hidden);
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  const body = f.messages[0].features.text;
+  assert.match(body, /Synthetic post 0/);
+  assert.equal(body.includes("Hidden wrapper sentence"), false);
+});
+
+test("a recycled card with a new status id does not keep a blocked reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const post = f.posts[0];
+  const link = element("a", { href: "/alice/status/111" });
+  post.append(link);
+  await f.scan();
+  revealPost(post);
+  const revealed = post.dataset.jevlensReveal;
+  assert.equal(post.dataset.jevlensKey, revealed);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  link.setAttribute("href", "/alice/status/222");
+  await f.rescan();
+  assert.notEqual(post.dataset.jevlensKey, revealed);
+  assert.equal(post.dataset.jevlensReveal, undefined);
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 0);
+});
+
+test("detaching a card without a settings change keeps its reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  const revealed = post.dataset.jevlensReveal;
+  post.remove();
+  await f.rescan();
+  f.attach(post);
+  await f.rescan();
+  assert.equal(post.dataset.jevlensReveal, revealed);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+});
+
 test("hidden text is not sent to the classifier", async () => {
   const f = fixture();
   const post = f.posts[0];
