@@ -116,8 +116,26 @@
     }
   }
 
-  // Page-hidden copy must not reach the classifier. Text hidden only by our own collapse is still
-  // the post: otherwise the reveal key would change the moment the card folds.
+  // While this is positive, the collapse stylesheet is off so getComputedStyle shows the site's
+  // own display. The mutation observer ignores those class flips.
+  let collapseSuspended = 0;
+
+  function withCollapseSuspended(fn) {
+    const root = document.documentElement;
+    collapseSuspended++;
+    const already = root?.classList?.contains("jevlens-suspend-collapse");
+    if (root && !already) root.classList.add("jevlens-suspend-collapse");
+    try {
+      return fn();
+    } finally {
+      collapseSuspended--;
+      if (root && !already) root.classList.remove("jevlens-suspend-collapse");
+    }
+  }
+
+  // Page-hidden copy must not reach the classifier. Callers measure while our collapse rule is
+  // suspended, so a direct child the site itself hides is still display:none, and text hidden
+  // only by JevLens stays visible to this check.
   function pageHidden(node) {
     if (!node || node.nodeType === 3) return false;
     if (node.hidden || node.getAttribute?.("hidden") != null) return true;
@@ -133,13 +151,11 @@
       return false;
     }
     if (visibility === "hidden" || visibility === "collapse") return true;
-    if (display !== "none") return false;
-    const parent = node.parentElement;
-    return !(parent?.classList?.contains("jevlens-collapsed") && !node.classList?.contains("jevlens-reveal"));
+    return display === "none";
   }
 
   // text() is also called on a [dir=auto] node directly. Hiding is often on a wrapper, not on
-  // that span, so the check has to walk ancestors. Our own collapse is exempt inside pageHidden.
+  // that span, so the check has to walk ancestors. Collapse is suspended before this runs.
   function concealed(node) {
     for (let current = node; current; current = current.parentElement) {
       if (extensionChrome(current) || pageHidden(current)) return true;
@@ -148,6 +164,10 @@
   }
 
   function text(el) {
+    return withCollapseSuspended(() => readText(el));
+  }
+
+  function readText(el) {
     if (!el || concealed(el)) return "";
     const chunks = [];
     const blocks = new Set(["ADDRESS", "ARTICLE", "BLOCKQUOTE", "DIV", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "P", "SECTION", "TR"]);
@@ -251,8 +271,9 @@
       if (!/^https?:/i.test(url)) return;
       width = Math.round(Number(width) || 0);
       height = Math.round(Number(height) || 0);
-      // Avoid avatars, emoji and UI icons. Social-media content images are normally much larger.
-      if (width && height && Math.max(width, height) < 140) return;
+      // Avatars and UI icons are small. A video poster is the same video on either side of that
+      // cutoff, so its identity must not depend on the filter.
+      if (kind !== "video_poster" && width && height && Math.max(width, height) < 140) return;
       if (/profile_images|emoji|avatar|profile_pic/i.test(url)) return;
       seen.add(url);
       out.push({
@@ -717,7 +738,10 @@
     }), delay);
   }
 
-  const observer = new MutationObserver(() => scheduleScan(120));
+  const observer = new MutationObserver(() => {
+    if (collapseSuspended) return;
+    scheduleScan(120);
+  });
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
   // SPA soft navigation does not reinject MV3 content scripts. Watch URL changes explicitly.

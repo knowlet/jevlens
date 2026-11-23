@@ -129,8 +129,13 @@ function fixture({ count = 1, settings = {}, deferSettings = false, platform = "
       const style = String(node?.getAttribute?.("style") || "");
       const inlineDisplay = style.match(/display\s*:\s*([^;]+)/i)?.[1]?.trim();
       const inlineVisibility = style.match(/visibility\s*:\s*([^;]+)/i)?.[1]?.trim();
+      // A site stylesheet, not an inline style. It stays hidden when JevLens suspends its own rule.
+      if (node?.classList?.contains("site-hidden")) {
+        return { display: "none", visibility: inlineVisibility || "visible" };
+      }
       let display = inlineDisplay || "block";
-      if (!inlineDisplay && node?.parentElement?.classList?.contains("jevlens-collapsed")
+      const suspended = root.classList.contains("jevlens-suspend-collapse");
+      if (!inlineDisplay && !suspended && node?.parentElement?.classList?.contains("jevlens-collapsed")
         && !node?.classList?.contains("jevlens-reveal")) display = "none";
       return { display, visibility: inlineVisibility || "visible" };
     },
@@ -503,6 +508,46 @@ test("video layout size does not retire a manual reveal", async () => {
   await f.rescan();
   assert.notEqual(post.dataset.jevlensKey, key);
   assert.equal(post.classList.contains("jevlens-collapsed"), true);
+});
+
+test("a site-hidden direct child stays out of CLASSIFY after JevLens collapses the card", async () => {
+  const f = fixture({ platform: "threads" });
+  const post = f.posts[0];
+  const hidden = element("div");
+  hidden.className = "site-hidden";
+  hidden.append(element("span", { dir: "auto" }, "Site stylesheet hid this longer sentence from the reader"));
+  post.append(hidden);
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].features.text.includes("Site stylesheet"), false);
+  assert.match(f.messages[0].features.text, /Synthetic post 0/);
+  f.reply(0, 0.95);
+  await settle();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  await f.rescan();
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].features.text.includes("Site stylesheet"), false);
+});
+
+test("resizing a video poster across the 140px cutoff keeps a manual reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const post = f.posts[0];
+  const size = { width: 100, height: 80 };
+  const video = element("video", { poster: "https://cdn.example/clip.jpg" });
+  video.poster = "https://cdn.example/clip.jpg";
+  video.getBoundingClientRect = () => ({ width: size.width, height: size.height });
+  post.append(video);
+  await f.scan();
+  revealPost(post);
+  const key = post.dataset.jevlensKey;
+  assert.equal(post.dataset.jevlensReveal, key);
+  size.width = 320;
+  size.height = 180;
+  await f.rescan();
+  assert.equal(post.dataset.jevlensKey, key);
+  assert.equal(post.dataset.jevlensReveal, key);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
 });
 
 test("a Threads dir=auto span inside a hidden wrapper is not classified", async () => {

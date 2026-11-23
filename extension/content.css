@@ -130,7 +130,7 @@
 @keyframes jevlens-pulse { 50% { opacity: .18; transform: scale(.75); } }
 
 .jevlens-dim { opacity: .38 !important; transition: opacity .15s ease; }
-.jevlens-collapsed > *:not(.jevlens-reveal) { display: none !important; }
+html:not(.jevlens-suspend-collapse) .jevlens-collapsed > *:not(.jevlens-reveal) { display: none !important; }
 .jevlens-reveal {
   display: block !important;
   border: 1px dashed currentColor !important;

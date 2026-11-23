@@ -18,6 +18,24 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+export function layoutShotPlan(workdir, env = process.env) {
+  return {
+    file: path.join(workdir, "layout.png"),
+    copyTo: env.JEVLENS_LAYOUT_SHOT || ""
+  };
+}
+
+export function publishLayoutShot(shot, copyTo) {
+  if (!copyTo) return shot;
+  mkdirSync(path.dirname(copyTo), { recursive: true });
+  copyFileSync(shot, copyTo);
+  return copyTo;
+}
+
+const invokedDirectly = process.argv[1]
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+async function main() {
 const here = path.dirname(fileURLToPath(import.meta.url));
 const extensionDir = path.join(here, "..", "extension");
 const chrome = process.env.JEVLENS_CHROME || "google-chrome";
@@ -269,7 +287,8 @@ function launchChrome(args) {
   return spawn(chrome, [...chromeArgs, ...args], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
 }
 
-const shot = path.join(workdir, "layout.png");
+const shotPlan = layoutShotPlan(workdir);
+const shot = shotPlan.file;
 const shotProc = launchChrome([
   `--user-data-dir=${path.join(workdir, "profile-shot")}`,
   `--screenshot=${shot}`,
@@ -289,9 +308,6 @@ if (lastSize < 1000) {
   console.error("layout-check: screenshot was not written");
   process.exit(2);
 }
-const proof = process.env.JEVLENS_LAYOUT_SHOT || "/opt/cursor/artifacts/jevlens-feed-layout.png";
-mkdirSync(path.dirname(proof), { recursive: true });
-copyFileSync(shot, proof);
 
 const domProc = launchChrome([
   `--user-data-dir=${path.join(workdir, "profile")}`,
@@ -382,7 +398,11 @@ for (const row of results) {
   }
 }
 
+const proof = publishLayoutShot(shot, shotPlan.copyTo);
 console.log(failures ? `\n${failures} layout check(s) failed` : `\nall ${results.length} scenarios passed`);
 console.log(`fixture: ${page}`);
 console.log(`screenshot: ${proof}`);
 process.exit(failures ? 1 : 0);
+}
+
+if (invokedDirectly) await main();
