@@ -28,6 +28,23 @@ async function getSettings() {
   return { ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) };
 }
 
+// Serialize additions handled by this service worker so concurrent messages do
+// not overwrite each other's read-modify-write snapshots. A failed operation
+// still rejects for its caller, but must not block later additions.
+let localBlockQueue = Promise.resolve();
+
+function addLocalBlockedHandle(value) {
+  const operation = localBlockQueue.then(async () => {
+    const settings = await getSettings();
+    const handle = String(value || "").toLowerCase();
+    const next = [...new Set([...(settings.localBlockedHandles || []), handle].filter(Boolean))];
+    await chrome.storage.sync.set({ localBlockedHandles: next });
+    return next;
+  });
+  localBlockQueue = operation.catch(() => {});
+  return operation;
+}
+
 async function getApiKey() {
   const { typesafeApiKey = "" } = await chrome.storage.local.get({ typesafeApiKey: "" });
   return String(typesafeApiKey || "").trim();
@@ -250,10 +267,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message?.type === "LOCAL_BLOCK") {
-      const settings = await getSettings();
-      const handle = String(message.handle || "").toLowerCase();
-      const next = [...new Set([...(settings.localBlockedHandles || []), handle].filter(Boolean))];
-      await chrome.storage.sync.set({ localBlockedHandles: next });
+      const next = await addLocalBlockedHandle(message.handle);
       sendResponse({ ok: true, handles: next });
       return;
     }

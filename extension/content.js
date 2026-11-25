@@ -387,8 +387,19 @@
       const block = document.createElement("button");
       block.textContent = `本機封鎖 ${handle}`;
       block.onclick = async () => {
-        await send({ type: "LOCAL_BLOCK", handle });
-        el.remove();
+        if (block.disabled) return;
+        block.disabled = true;
+        block.textContent = "封鎖中…";
+        try {
+          const response = await send({ type: "LOCAL_BLOCK", handle });
+          if (response?.ok === true) {
+            el.remove();
+          } else {
+            block.textContent = "封鎖未儲存，重試";
+          }
+        } finally {
+          block.disabled = false;
+        }
       };
       reveal.appendChild(block);
     }
