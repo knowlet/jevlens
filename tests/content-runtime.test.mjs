@@ -722,3 +722,36 @@ test("a new local block replaces prior dim styling before manual reveal", async 
   assert.equal(f.posts[0].querySelector(".jevlens-analysis"), null);
   assert.equal(f.messages.length, 1);
 });
+
+test("two cards for the same post keep their own pending classification", async () => {
+  const f = fixture({ count: 2 });
+  f.posts[1].querySelector('[data-testid="tweetText"]').textContent = "Synthetic post 0";
+  f.posts[1].querySelector('[data-testid="User-Name"]').textContent = "@user0";
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(f.posts[0].dataset.jevlensKey, f.posts[1].dataset.jevlensKey);
+  f.reply(0, 0);
+  await settle();
+  await f.rescan();
+  assert.equal(f.messages.length, 2, "a completed sibling must not clear another card's pending work");
+  f.reply(1, 0);
+  await settle();
+  assert.equal(f.posts[1].dataset.jevlensDone, "1");
+});
+
+test("recycling one card does not clear the identical sibling's pending classification", async () => {
+  const f = fixture({ count: 2 });
+  f.posts[1].querySelector('[data-testid="tweetText"]').textContent = "Synthetic post 0";
+  f.posts[1].querySelector('[data-testid="User-Name"]').textContent = "@user0";
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(f.posts[0].dataset.jevlensKey, f.posts[1].dataset.jevlensKey);
+  f.posts[0].querySelector('[data-testid="tweetText"]').textContent = "A replacement post for card zero";
+  await f.rescan();
+  assert.equal(f.messages.length, 3, "only the recycled card should need a new classification");
+  f.reply(1, 0);
+  f.reply(2, 0);
+  await settle();
+  assert.equal(f.posts[1].dataset.jevlensDone, "1");
+  assert.equal(f.posts[0].dataset.jevlensDone, "1");
+});

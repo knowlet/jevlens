@@ -8,7 +8,8 @@
   let postSerial = 0;
   let workSerial = 0;
   const queue = [];
-  const queuedKeys = new Set();
+  // Each DOM card owns its work even when another card has identical post features.
+  const pendingWorkIds = new Set();
   // WeakRefs so an infinite feed can drop detached cards. A strong Set would keep every card
   // alive until the next settings change. Dead refs are pruned on each scan; a card the page
   // still holds stays reachable for that toggle.
@@ -53,7 +54,7 @@
     const disabled = areaName === "sync" && changes.enabled?.newValue === false;
     settingsCache = disabled ? { enabled: false } : null;
     queue.length = 0;
-    queuedKeys.clear();
+    pendingWorkIds.clear();
     // A settings change is a new decision. A manual reveal does not survive it, including on a
     // card that is currently detached.
     visitPosts(el => {
@@ -695,9 +696,8 @@
       }
     } finally {
       running--;
-      // A→B→A reuses the feature key. Only the work item currently stored on the card may render
-      // or retire that pending key; the first A reply is stale once a newer item exists.
-      if (generation === settingsGeneration && ownsCard()) queuedKeys.delete(key);
+      // Work IDs are unique across cards and settings generations. Retire only this item.
+      pendingWorkIds.delete(workId);
       pump();
       updateHud();
     }
@@ -717,12 +717,12 @@
       delete el.dataset.jevlensReveal;
       // A recycled card still carries the previous post's 顯示 button until the new decision lands.
       releasePostState(el);
-      queuedKeys.delete(el.dataset.jevlensKey);
+      pendingWorkIds.delete(el.dataset.jevlensWork);
     }
     // A reveal is not classification. Done stays whatever the last real decision set, so a stale
     // 顯示 click cannot mark an unblocked card finished.
     if (el.dataset.jevlensKey === key && ["1", "error"].includes(el.dataset.jevlensDone)) return;
-    if (queuedKeys.has(key) && el.dataset.jevlensKey === key) return;
+    if (el.dataset.jevlensKey === key && pendingWorkIds.has(el.dataset.jevlensWork)) return;
 
     const old = ownAnalysis(el);
     if (old && el.dataset.jevlensKey !== key) old.remove();
@@ -734,7 +734,7 @@
     const mount = analysisMount(el, features.platform, features);
     setPending(mount, "Jev · 排隊中…");
 
-    queuedKeys.add(key);
+    pendingWorkIds.add(workId);
     queue.push({ el, features, key, mount, generation: settingsGeneration, workId });
     stats.queued++;
     pump();
