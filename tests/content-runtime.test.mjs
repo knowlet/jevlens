@@ -1,0 +1,1002 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import vm from "node:vm";
+
+const content = fs.readFileSync(new URL("../extension/content.js", import.meta.url), "utf8");
+const signals = fs.readFileSync(new URL("../extension/lib/signals.js", import.meta.url), "utf8");
+
+// Small, offline DOM fixture. Run the unmodified content-script entry point and real signals,
+// with controllable Chrome replies/timers so interrupted feed analysis is deterministic.
+function element(tag, attributes = {}, value = "") {
+  const node = {
+    tagName: tag, nodeType: 1, attributes, dataset: {}, children: [], parentElement: null,
+    className: "", ownText: value,
+    get childNodes() {
+      const nodes = [];
+      if (this.ownText) nodes.push({ nodeType: 3, nodeValue: this.ownText, textContent: this.ownText });
+      nodes.push(...this.children);
+      return nodes;
+    },
+    get isConnected() { return this.root || Boolean(this.parentElement?.isConnected); },
+    get textContent() { return this.ownText + this.children.map(child => child.textContent).join(""); },
+    set textContent(value) { this.replaceChildren(); this.ownText = value; },
+    get innerText() { return this.textContent; },
+    get nextSibling() { return this.parentElement?.children[this.parentElement.children.indexOf(this) + 1]; },
+    setAttribute(key, value) { this.attributes[key] = value; },
+    getAttribute(key) {
+      if (key.startsWith("data-")) {
+        const name = key.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        return this.dataset[name] ?? this.attributes[key] ?? null;
+      }
+      return this.attributes[key] ?? null;
+    },
+    remove() {
+      if (!this.parentElement) return;
+      this.parentElement.children.splice(this.parentElement.children.indexOf(this), 1);
+      this.parentElement = null;
+    },
+    insertBefore(child, ref) {
+      child.remove();
+      const index = this.children.indexOf(ref);
+      this.children.splice(index < 0 ? this.children.length : index, 0, child);
+      child.parentElement = this;
+      return child;
+    },
+    appendChild(child) { return this.insertBefore(child, null); },
+    append(...children) { children.forEach(child => this.appendChild(child)); },
+    prepend(child) { this.insertBefore(child, this.children[0]); },
+    replaceChildren(...children) {
+      this.children.forEach(child => { child.parentElement = null; });
+      this.children = [];
+      this.ownText = "";
+      this.append(...children);
+    },
+    contains(other) {
+      for (let n = other; n; n = n.parentElement) if (n === this) return true;
+      return false;
+    },
+    closest(selector) {
+      for (let n = this; n; n = n.parentElement) if (selector.split(",").some(s => matches(n, s.trim()))) return n;
+      return null;
+    },
+    querySelectorAll(selector) {
+      const selectors = selector.split(",").map(s => s.trim());
+      const out = [];
+      const walk = parent => parent.children.forEach(child => {
+        if (selectors.some(s => s.startsWith(":scope > ")
+          ? parent === this && matches(child, s.slice(9)) : matches(child, s))) out.push(child);
+        walk(child);
+      });
+      walk(this);
+      return out;
+    },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  };
+  node.classList = {
+    contains: c => node.className.split(/\s+/).includes(c),
+    add: c => { if (!node.classList.contains(c)) node.className = `${node.className} ${c}`.trim(); },
+    remove: c => { node.className = node.className.split(/\s+/).filter(x => x !== c).join(" "); }
+  };
+  return node;
+}
+
+function matches(node, selector) {
+  const tag = selector.match(/^[\w-]+/)?.[0];
+  if (tag && tag !== node.tagName) return false;
+  for (const [, name] of selector.matchAll(/\.([\w-]+)/g)) {
+    if (!node.classList.contains(name)) return false;
+  }
+  for (const [, key, op, value] of selector.matchAll(/\[([\w-]+)(?:([*^]?=)"([^"]*)")?\]/g)) {
+    const actual = node.getAttribute(key);
+    if (actual == null || (op === "=" && actual !== value)
+      || (op === "^=" && !actual.startsWith(value)) || (op === "*=" && !actual.includes(value))) return false;
+  }
+  return true;
+}
+
+function fixture({ count = 1, settings = {}, deferSettings = false, platform = "x" } = {}) {
+  let current = { enabled: true, threshold: 0.68, actionMode: "collapse", ...settings };
+  let onChanged;
+  let onMutation;
+  let nextTimer;
+  const messages = [];
+  const pendingSettings = [];
+  const root = element("html");
+  root.root = true;
+  const hud = element("div");
+  const status = element("span");
+  status.className = "jevlens-hud-status";
+  hud.append(status);
+  root.append(hud);
+  const posts = Array.from({ length: count }, (_, i) => {
+    const post = element("article", { "data-testid": "tweet" });
+    const column = element("div");
+    column.append(element(platform === "threads" ? "a" : "span", { "data-testid": "User-Name", ...(platform === "threads" ? { dir: "auto", href: `/@user${i}` } : {}) }, `@user${i}`));
+    column.append(element("div", { "data-testid": "tweetText", ...(platform === "threads" ? { dir: "auto" } : {}) }, `Synthetic post ${i}`));
+    post.append(column);
+    root.append(post);
+    return post;
+  });
+  const context = {
+    document: {
+      documentElement: root,
+      getElementById: () => hud,
+      createElement: tag => element(tag),
+      querySelectorAll: selector => root.querySelectorAll(selector)
+    },
+    getComputedStyle: node => {
+      const style = String(node?.getAttribute?.("style") || "");
+      if (node?.getAttribute?.("data-no-computed") != null) return {};
+      let display = "";
+      let visibility = "";
+      for (const decl of style.split(";")) {
+        const splitAt = decl.indexOf(":");
+        if (splitAt < 0) continue;
+        const prop = decl.slice(0, splitAt).trim().toLowerCase();
+        const value = decl.slice(splitAt + 1).trim().toLowerCase().split(/\s+/)[0] || "";
+        if (prop === "display") display = value;
+        else if (prop === "visibility") visibility = value;
+      }
+      // A site stylesheet, not an inline style. It stays hidden when JevLens suspends its own rule.
+      if (node?.classList?.contains("site-hidden")) {
+        return { display: "none", visibility: visibility || "visible" };
+      }
+      const inlineDisplay = display;
+      let resolved = inlineDisplay || "block";
+      const suspended = root.classList.contains("jevlens-suspend-collapse");
+      if (!inlineDisplay && !suspended && node?.parentElement?.classList?.contains("jevlens-collapsed")
+        && !node?.classList?.contains("jevlens-reveal")) resolved = "none";
+      return { display: resolved, visibility: visibility || "visible" };
+    },
+    location: { hostname: platform === "threads" ? "threads.com" : "x.com", href: `https://${platform === "threads" ? "threads.com" : "x.com"}/home` },
+    chrome: {
+      runtime: { sendMessage(message, callback) {
+        if (message.type === "GET_SETTINGS") {
+          if (deferSettings) pendingSettings.push({ callback, settings: { ...current } });
+          else callback({ ok: true, settings: { ...current } });
+        } else {
+          assert.equal(message.type, "CLASSIFY");
+          messages.push({ ...message, callback });
+        }
+      } },
+      storage: { onChanged: { addListener(listener) { onChanged = listener; } } }
+    },
+    MutationObserver: class { constructor(callback) { onMutation = callback; } observe() {} },
+    setTimeout(fn) { nextTimer = fn; return 1; },
+    clearTimeout() { nextTimer = null; },
+    setInterval() {}
+  };
+  vm.runInNewContext(signals + "\n" + content, context);
+  return {
+    posts, hud, status, messages, pendingSettings,
+    async scan() { const fn = nextTimer; nextTimer = null; fn?.(); await settle(); },
+    async rescan() { onMutation(); await this.scan(); },
+    attach(post) { root.append(post); },
+    change(values, area = "sync") {
+      const changes = Object.fromEntries(Object.entries(values).map(([key, value]) =>
+        [key, { oldValue: current[key], newValue: value }]));
+      current = { ...current, ...values };
+      onChanged(changes, area);
+    },
+    reply(index, risk = 0.9) {
+      messages[index].callback({ ok: true, result: { source: "jev_direct", risk: { spam: risk }, labels: {} } });
+    }
+  };
+}
+
+async function settle() { await new Promise(resolve => setImmediate(resolve)); }
+function assertReleased(post) {
+  assert.equal(post.classList.contains("jevlens-dim"), false);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.dataset.jevlensCollapse, undefined);
+  assert.equal(post.querySelector(".jevlens-reveal"), null);
+  assert.equal(post.querySelector('.jevlens-analysis[data-owner="jevlens"]'), null);
+  assert.equal(post.dataset.jevlensDone, "0");
+}
+
+for (const mode of ["collapse", "dim"]) {
+  test(`disabling restores an already ${mode}-filtered post and re-enabling analyzes again`, async () => {
+    const f = fixture({ settings: { actionMode: mode } });
+    await f.scan();
+    f.reply(0);
+    await settle();
+    assert.equal(f.posts[0].classList.contains(mode === "dim" ? "jevlens-dim" : "jevlens-collapsed"), true);
+    f.change({ enabled: false });
+    await f.scan();
+    assertReleased(f.posts[0]);
+    assert.equal(f.status.textContent, "已停用");
+    f.change({ enabled: true });
+    await f.scan();
+    assert.equal(f.messages.length, 2);
+    f.reply(1, 0);
+    await settle();
+    assert.equal(f.posts[0].dataset.jevlensDone, "1");
+    assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+    assert.equal(f.posts[0].classList.contains("jevlens-dim"), false);
+  });
+}
+
+test("disabling releases locally blocked posts without classifying", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 0);
+  f.change({ enabled: false });
+  await f.scan();
+  assertReleased(f.posts[0]);
+});
+
+test("late classifications cannot restore filtering or replace the disabled HUD", async () => {
+  const f = fixture();
+  await f.scan();
+  f.change({ enabled: false });
+  await f.scan();
+  f.reply(0);
+  await settle();
+  assertReleased(f.posts[0]);
+  assert.equal(f.status.textContent, "已停用");
+  assert.notEqual(f.hud.dataset.state, "working");
+});
+
+test("disabling clears queued posts and ignores late errors", async () => {
+  const f = fixture({ count: 6 });
+  await f.scan();
+  assert.equal(f.messages.length, 4);
+  f.change({ enabled: false });
+  await f.scan();
+  for (const message of [...f.messages]) message.callback({ ok: false, error: "late failure" });
+  await settle();
+  assert.equal(f.messages.length, 4);
+  f.posts.forEach(assertReleased);
+  assert.equal(f.status.textContent, "已停用");
+  assert.equal(f.hud.dataset.state, "ready");
+  f.change({ enabled: true });
+  await f.scan();
+  assert.equal(f.messages.length, 8);
+  for (let i = 4; i < 8; i++) f.reply(i, 0);
+  await settle();
+  assert.equal(f.messages.length, 10);
+  f.reply(8, 0);
+  f.reply(9, 0);
+  await settle();
+  assert.ok(f.posts.every(post => post.dataset.jevlensDone === "1"));
+});
+
+test("rapid disable/re-enable rejects older results without dropping the new pending key", async () => {
+  const f = fixture();
+  await f.scan();
+  f.change({ enabled: false });
+  f.change({ enabled: true });
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  f.reply(0);
+  await settle();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.posts[0].dataset.jevlensDone, "0");
+  await f.rescan();
+  assert.equal(f.messages.length, 2);
+  f.reply(1, 0);
+  await settle();
+  assert.equal(f.posts[0].dataset.jevlensDone, "1");
+});
+
+test("an in-flight settings response cannot undo disabling", async () => {
+  const f = fixture({ deferSettings: true });
+  await f.scan();
+  assert.equal(f.pendingSettings.length, 1);
+  f.change({ enabled: false });
+  await f.scan();
+  f.pendingSettings[0].callback({ ok: true, settings: f.pendingSettings[0].settings });
+  await settle();
+  assert.equal(f.messages.length, 0);
+  assert.equal(f.status.textContent, "已停用");
+  assert.equal(f.posts[0].querySelector(".jevlens-analysis"), null);
+});
+
+test("changed action settings invalidate an older classification", async () => {
+  const f = fixture();
+  await f.scan();
+  f.change({ actionMode: "mark" });
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  f.reply(1);
+  await settle();
+  f.reply(0);
+  await settle();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.posts[0].dataset.jevlensDone, "1");
+});
+
+test("background cache writes do not discard a valid classification", async () => {
+  const f = fixture();
+  await f.scan();
+  f.change({ cache: {} }, "local");
+  f.reply(0);
+  await settle();
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.posts[0].dataset.jevlensDone, "1");
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), true);
+});
+
+function revealPost(post) {
+  // The fixture supports descendant lookup through the reveal node.
+  const show = post.querySelector(".jevlens-reveal").querySelector("button");
+  show.onclick();
+  return show;
+}
+
+test("local-block reveal survives repeated clicks and unchanged rescans", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@USER0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  const show = revealPost(post);
+  show.onclick();
+  for (let i = 0; i < 3; i++) await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.querySelector(".jevlens-reveal"), null);
+  assert.equal(post.querySelector(".jevlens-analysis"), null);
+  assert.equal(post.dataset.jevlensDone, "1");
+  assert.equal(f.messages.length, 0);
+});
+
+test("a real setting change reapplies a local block and allows another reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  f.change({ threshold: 0.8 });
+  await f.scan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  revealPost(post);
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+});
+
+test("removing and restoring a blocklist entry reprocesses the post", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  f.change({ localBlockedHandles: [] });
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  f.reply(0, 0);
+  await settle();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  f.change({ localBlockedHandles: ["@user0"] });
+  await f.scan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), true);
+  revealPost(f.posts[0]);
+  await f.rescan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 1);
+});
+
+test("re-enabling reapplies a revealed local block without classification", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  revealPost(f.posts[0]);
+  f.change({ enabled: false });
+  await f.scan();
+  assertReleased(f.posts[0]);
+  f.change({ enabled: true });
+  await f.scan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), true);
+  revealPost(f.posts[0]);
+  await f.rescan();
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+});
+
+test("changed content and recycled authors do not inherit a local-block reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  post.querySelector('[data-testid="tweetText"]').textContent = "A different synthetic post";
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 0);
+  revealPost(post);
+  post.querySelector('[data-testid="User-Name"]').textContent = "@other";
+  await f.rescan();
+  assert.equal(f.messages.length, 1);
+  f.reply(0, 0);
+  await settle();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.dataset.jevlensDone, "1");
+});
+
+test("Threads local-block reveal survives rescans and changed text is reprocessed", async () => {
+  const f = fixture({ platform: "threads", settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  await f.rescan();
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  post.querySelector('[data-testid="tweetText"]').textContent = "Changed synthetic Threads post";
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 0);
+});
+
+function nestQuote(outer) {
+  const nested = element("article", { "data-testid": "tweet" });
+  const column = element("div");
+  column.append(element("span", { "data-testid": "User-Name" }, "@quoted"));
+  column.append(element("div", { "data-testid": "tweetText" }, "Quoted words from an embedded post"));
+  nested.append(column);
+  outer.children[0].append(nested);
+  return nested;
+}
+
+test("blocking an outer post leaves a nested post's pending analysis row", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const outer = f.posts[0];
+  const nested = nestQuote(outer);
+  await f.scan();
+  const rows = [...outer.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]')];
+  assert.equal(rows.length, 1);
+  assert.equal(nested.contains(rows[0]), true);
+  assert.equal(rows[0].dataset.state, "pending");
+  assert.equal(rows[0].dataset.jevlensOwner, nested.dataset.jevlensPost);
+  assert.notEqual(rows[0].dataset.jevlensOwner, outer.dataset.jevlensPost);
+  assert.equal(outer.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].features.handle, "@quoted");
+  f.reply(0, 0);
+  await settle();
+  assert.equal(nested.contains(rows[0]), true);
+  assert.equal(rows[0].dataset.state, "low");
+  assert.equal(nested.classList.contains("jevlens-collapsed"), false);
+  revealPost(outer);
+  await f.rescan();
+  assert.equal(outer.classList.contains("jevlens-collapsed"), false);
+  assert.equal(outer.querySelector(":scope > .jevlens-reveal"), null);
+  assert.equal(nested.contains(rows[0]), true);
+  assert.equal(rows[0].dataset.state, "low");
+  assert.equal(f.messages.length, 1);
+});
+
+test("a reused card drops the previous reveal button", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  assert.ok(post.querySelector(":scope > .jevlens-reveal"));
+  post.querySelector('[data-testid="User-Name"]').textContent = "@someoneelse";
+  post.querySelector('[data-testid="tweetText"]').textContent = "A recycled card with different words";
+  await f.rescan();
+  assert.equal(post.querySelector(".jevlens-reveal"), null);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.dataset.jevlensReveal, undefined);
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].features.handle, "@someoneelse");
+});
+
+test("a detached card does not stay revealed after a settings toggle", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  const revealed = post.dataset.jevlensReveal;
+  assert.ok(revealed);
+  post.remove();
+  assert.equal(post.isConnected, false);
+  f.change({ threshold: 0.5 });
+  assert.equal(post.dataset.jevlensReveal, undefined);
+  assert.equal(post.dataset.jevlensDone, "0");
+  f.attach(post);
+  await f.scan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.ok(post.querySelector(":scope > .jevlens-reveal"));
+  assert.notEqual(post.dataset.jevlensReveal, revealed);
+});
+
+test("video layout size does not retire a manual reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const post = f.posts[0];
+  const size = { width: 320, height: 180 };
+  const video = element("video", { poster: "https://cdn.example/clip.jpg" });
+  video.poster = "https://cdn.example/clip.jpg";
+  video.getBoundingClientRect = () => ({ width: size.width, height: size.height });
+  post.append(video);
+  await f.scan();
+  revealPost(post);
+  const key = post.dataset.jevlensKey;
+  assert.equal(post.dataset.jevlensReveal, key);
+  size.width = 960;
+  size.height = 540;
+  await f.rescan();
+  assert.equal(post.dataset.jevlensKey, key);
+  assert.equal(post.dataset.jevlensReveal, key);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+  video.poster = "https://cdn.example/other-clip.jpg";
+  video.setAttribute("poster", video.poster);
+  await f.rescan();
+  assert.notEqual(post.dataset.jevlensKey, key);
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+});
+
+test("a site-hidden direct child stays out of CLASSIFY after JevLens collapses the card", async () => {
+  const f = fixture({ platform: "threads" });
+  const post = f.posts[0];
+  const hidden = element("div");
+  hidden.className = "site-hidden";
+  hidden.append(element("span", { dir: "auto" }, "Site stylesheet hid this longer sentence from the reader"));
+  post.append(hidden);
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].features.text.includes("Site stylesheet"), false);
+  assert.match(f.messages[0].features.text, /Synthetic post 0/);
+  f.reply(0, 0.95);
+  await settle();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  await f.rescan();
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].features.text.includes("Site stylesheet"), false);
+});
+
+test("resizing a video poster across the 140px cutoff keeps a manual reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const post = f.posts[0];
+  const size = { width: 100, height: 80 };
+  const video = element("video", { poster: "https://cdn.example/clip.jpg" });
+  video.poster = "https://cdn.example/clip.jpg";
+  video.getBoundingClientRect = () => ({ width: size.width, height: size.height });
+  post.append(video);
+  await f.scan();
+  revealPost(post);
+  const key = post.dataset.jevlensKey;
+  assert.equal(post.dataset.jevlensReveal, key);
+  size.width = 320;
+  size.height = 180;
+  await f.rescan();
+  assert.equal(post.dataset.jevlensKey, key);
+  assert.equal(post.dataset.jevlensReveal, key);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+});
+
+test("a Threads dir=auto span inside a hidden wrapper is not classified", async () => {
+  const f = fixture({ platform: "threads" });
+  const post = f.posts[0];
+  const hidden = element("div", { style: "display: none" });
+  hidden.append(element("span", { dir: "auto" }, "Hidden wrapper sentence that is longer than the visible post"));
+  post.append(hidden);
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  const body = f.messages[0].features.text;
+  assert.match(body, /Synthetic post 0/);
+  assert.equal(body.includes("Hidden wrapper sentence"), false);
+});
+
+test("a recycled card with a new status id does not keep a blocked reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const post = f.posts[0];
+  const link = element("a", { href: "/alice/status/111" });
+  post.append(link);
+  await f.scan();
+  revealPost(post);
+  const revealed = post.dataset.jevlensReveal;
+  assert.equal(post.dataset.jevlensKey, revealed);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  link.setAttribute("href", "/alice/status/222");
+  await f.rescan();
+  assert.notEqual(post.dataset.jevlensKey, revealed);
+  assert.equal(post.dataset.jevlensReveal, undefined);
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  assert.equal(f.messages.length, 0);
+});
+
+test("detaching a card without a settings change keeps its reveal", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  revealPost(post);
+  const revealed = post.dataset.jevlensReveal;
+  post.remove();
+  await f.rescan();
+  f.attach(post);
+  await f.rescan();
+  assert.equal(post.dataset.jevlensReveal, revealed);
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.messages.length, 0);
+});
+
+test("a stale reveal click after unblock does not skip classification", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  await f.scan();
+  const post = f.posts[0];
+  const show = post.querySelector(".jevlens-reveal").querySelector("button");
+  f.change({ localBlockedHandles: [] });
+  show.onclick();
+  assert.equal(post.dataset.jevlensReveal, undefined);
+  assert.notEqual(post.dataset.jevlensDone, "1");
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  assert.ok(post.querySelector('.jevlens-analysis[data-owner="jevlens"]'));
+  assert.equal(post.dataset.jevlensDone, "0");
+});
+
+test("a recycled card ignores the first reply when the same post returns", async () => {
+  const f = fixture();
+  const post = f.posts[0];
+  const textNode = post.querySelector('[data-testid="tweetText"]');
+  const original = textNode.textContent;
+  await f.scan();
+  textNode.textContent = "Completely different post B text";
+  await f.rescan();
+  textNode.textContent = original;
+  await f.rescan();
+  assert.equal(f.messages.length, 3);
+  const row = post.querySelector('.jevlens-analysis[data-owner="jevlens"]');
+  f.reply(0, 0.95);
+  await settle();
+  assert.notEqual(post.dataset.jevlensDone, "1");
+  assert.equal(row.dataset.state, "pending");
+  assert.equal(post.contains(row), true);
+  f.reply(2, 0.2);
+  await settle();
+  assert.equal(post.dataset.jevlensDone, "1");
+  assert.equal(post.contains(row), true);
+  assert.equal(row.dataset.state, "low");
+});
+
+test("later display values and custom properties stay visible", async () => {
+  for (const [style, phrase] of [
+    ["display:none; display:block", "shown after none and still the visible sentence"],
+    ["--menu-display:none", "custom property text stays on the visible sentence"]
+  ]) {
+    const f = fixture({ platform: "threads" });
+    f.posts[0].append(element("span", { dir: "auto", style }, phrase));
+    await f.scan();
+    assert.equal(f.messages[0].features.text, phrase);
+  }
+  const hidden = fixture({ platform: "threads" });
+  hidden.posts[0].append(element("span", {
+    dir: "auto",
+    style: "display:block; display:none",
+    "data-no-computed": ""
+  }, "really hidden phrase that must not be classified"));
+  await hidden.scan();
+  assert.equal(hidden.messages[0].features.text.includes("really hidden phrase"), false);
+  assert.match(hidden.messages[0].features.text, /Synthetic post 0/);
+});
+
+test("hidden text is not sent to the classifier", async () => {
+  const f = fixture();
+  const post = f.posts[0];
+  const tweet = post.querySelector('[data-testid="tweetText"]');
+  tweet.append(element("span", { hidden: "" }, "secret hidden phrase"));
+  tweet.append(element("span", { style: "display: none" }, "stylesheet hidden phrase"));
+  tweet.append(element("span", { style: "visibility: hidden" }, "visibility hidden phrase"));
+  await f.scan();
+  assert.equal(f.messages.length, 1);
+  const body = f.messages[0].features.text;
+  assert.match(body, /Synthetic post 0/);
+  assert.equal(body.includes("secret hidden phrase"), false);
+  assert.equal(body.includes("stylesheet hidden phrase"), false);
+  assert.equal(body.includes("visibility hidden phrase"), false);
+});
+
+test("a manual reveal survives the next scan", async () => {
+  const f = fixture({ settings: { localBlockedHandles: ["@user0"] } });
+  const post = f.posts[0];
+  // No dedicated text node: the card text includes the reveal banner unless extraction ignores it.
+  delete post.querySelector('[data-testid="tweetText"]').attributes["data-testid"];
+  await f.scan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), true);
+  const keyWhileOpen = post.dataset.jevlensKey;
+  await f.rescan();
+  assert.equal(post.dataset.jevlensKey, keyWhileOpen);
+  revealPost(post);
+  assert.equal(post.dataset.jevlensReveal, keyWhileOpen);
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.querySelector(":scope > .jevlens-reveal"), null);
+  // The scanner has to honor the stored decision even if this version is queued again.
+  post.dataset.jevlensDone = "0";
+  await f.rescan();
+  assert.equal(post.classList.contains("jevlens-collapsed"), false);
+  assert.equal(post.querySelector(":scope > .jevlens-reveal"), null);
+  assert.equal(post.dataset.jevlensReveal, keyWhileOpen);
+  assert.equal(post.dataset.jevlensDone, "1");
+  assert.equal(f.messages.length, 0);
+});
+
+test("a new local block replaces prior dim styling before manual reveal", async () => {
+  const f = fixture({ settings: { actionMode: "dim" } });
+  await f.scan();
+  f.reply(0);
+  await settle();
+  assert.equal(f.posts[0].classList.contains("jevlens-dim"), true);
+  f.change({ localBlockedHandles: ["@user0"] });
+  await f.scan();
+  revealPost(f.posts[0]);
+  await f.rescan();
+  assert.equal(f.posts[0].classList.contains("jevlens-dim"), false);
+  assert.equal(f.posts[0].classList.contains("jevlens-collapsed"), false);
+  assert.equal(f.posts[0].querySelector(".jevlens-analysis"), null);
+  assert.equal(f.messages.length, 1);
+});
+
+test("two cards for the same post keep their own pending classification", async () => {
+  const f = fixture({ count: 2 });
+  f.posts[1].querySelector('[data-testid="tweetText"]').textContent = "Synthetic post 0";
+  f.posts[1].querySelector('[data-testid="User-Name"]').textContent = "@user0";
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(f.posts[0].dataset.jevlensKey, f.posts[1].dataset.jevlensKey);
+  f.reply(0, 0);
+  await settle();
+  await f.rescan();
+  assert.equal(f.messages.length, 2, "a completed sibling must not clear another card's pending work");
+  f.reply(1, 0);
+  await settle();
+  assert.equal(f.posts[1].dataset.jevlensDone, "1");
+});
+
+test("recycling one card does not clear the identical sibling's pending classification", async () => {
+  const f = fixture({ count: 2 });
+  f.posts[1].querySelector('[data-testid="tweetText"]').textContent = "Synthetic post 0";
+  f.posts[1].querySelector('[data-testid="User-Name"]').textContent = "@user0";
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(f.posts[0].dataset.jevlensKey, f.posts[1].dataset.jevlensKey);
+  f.posts[0].querySelector('[data-testid="tweetText"]').textContent = "A replacement post for card zero";
+  await f.rescan();
+  assert.equal(f.messages.length, 3, "only the recycled card should need a new classification");
+  f.reply(1, 0);
+  f.reply(2, 0);
+  await settle();
+  assert.equal(f.posts[1].dataset.jevlensDone, "1");
+  assert.equal(f.posts[0].dataset.jevlensDone, "1");
+});
+
+function cloneCard(node) {
+  const clone = element(node.tagName, { ...node.attributes }, node.ownText);
+  clone.dataset = { ...node.dataset };
+  clone.className = node.className;
+  clone.append(...node.children.map(cloneCard));
+  return clone;
+}
+
+test("a clone of a pending card receives independent work", async () => {
+  const f = fixture({ count: 1 });
+  await f.scan();
+  const clone = cloneCard(f.posts[0]);
+  f.attach(clone);
+  await f.rescan();
+  assert.equal(f.messages.length, 2);
+  assert.notEqual(clone.dataset.jevlensPost, f.posts[0].dataset.jevlensPost);
+  assert.equal(clone.querySelectorAll(".jevlens-analysis").length, 1);
+  f.reply(0, 0);
+  f.reply(1, 0);
+  await settle();
+  assert.equal(clone.dataset.jevlensDone, "1");
+});
+
+test("an already analyzed clone does not inherit the original decision", async () => {
+  const f = fixture({ count: 1, actionMode: "collapse" });
+  await f.scan();
+  f.reply(0);
+  await settle();
+  const original = f.posts[0];
+  const clone = cloneCard(original);
+  f.attach(clone);
+  await f.rescan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(clone.classList.contains("jevlens-collapsed"), false);
+  assert.equal(clone.querySelectorAll(".jevlens-analysis").length, 1);
+  assert.equal(original.dataset.jevlensDone, "1");
+});
+
+for (const completed of [false, true]) {
+  test(`a deep clone preserves its genuine nested card's ${completed ? "completed" : "pending"} analysis`, async () => {
+    const f = fixture({ count: 1, settings: { actionMode: "mark" } });
+    await f.scan();
+    const original = f.posts[0];
+    const copied = cloneCard(original);
+    copied.querySelector('[data-testid="tweetText"]').textContent = "Distinct outer body";
+    copied.querySelector('[data-testid="User-Name"]').textContent = "@outer-copy";
+    const originalRow = original.querySelector(".jevlens-analysis");
+    if (completed) {
+      f.reply(0, 0);
+      await settle();
+    }
+    copied.children[0].append(original);
+    f.attach(copied);
+    await f.rescan();
+    assert.equal(f.messages.length, 2);
+    f.reply(1, 0);
+    if (!completed) f.reply(0, 0.9);
+    await settle();
+    await f.rescan();
+    const own = card => card.querySelectorAll(".jevlens-analysis")
+      .filter(row => row.closest("[data-jevlens-post]") === card);
+    assert.deepEqual(own(original), [originalRow]);
+    assert.equal(own(copied).length, 1);
+    assert.equal(own(copied)[0].dataset.state, "low");
+    assert.equal(originalRow.dataset.state, completed ? "low" : "high");
+  });
+}
+
+for (const duplicate of [false, true]) {
+  test(`Threads disables and restores each nested badge once${duplicate ? " for a deep clone" : ""}`, async () => {
+    const f = fixture({ count: 1, platform: "threads", settings: { actionMode: "mark" } });
+    const outer = f.posts[0];
+    outer.querySelector('[data-testid="tweetText"]').textContent = "Short caption";
+    const nested = nestQuote(outer);
+    nested.querySelector('[data-testid="tweetText"]').setAttribute("dir", "auto");
+    nested.querySelector('[data-testid="tweetText"]').textContent = "Distinct longer quoted post, not the outer caption";
+    const cards = [outer];
+    if (duplicate) {
+      const copy = cloneCard(outer);
+      f.attach(copy);
+      cards.push(copy);
+    }
+    const rows = () => cards.reduce((n, c) => n + c.querySelectorAll(".jevlens-analysis").length, 0);
+    await f.scan();
+    const count = duplicate ? 4 : 2;
+    assert.equal(f.messages.length, count);
+    for (let i = 0; i < count; i++) f.reply(i, 0);
+    await settle();
+    assert.equal(rows(), count);
+    f.change({ enabled: false });
+    await f.scan();
+    assert.equal(rows(), 0, "disable must remove every badge");
+    f.change({ enabled: true });
+    await f.scan();
+    for (let i = count; i < count * 2; i++) f.reply(i, 0);
+    await settle();
+    assert.equal(rows(), count);
+    assert.equal(f.messages[0].features.text, "Short caption");
+    assert.equal(f.messages[1].features.text, "Distinct longer quoted post, not the outer caption");
+  });
+}
+
+test("X keeps its own post text when a quoted card comes first", async () => {
+  const f = fixture({ count: 1, settings: { actionMode: "mark" } });
+  const outer = f.posts[0];
+  const nested = nestQuote(outer);
+  outer.children[0].prepend(nested);
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(f.messages[0].features.text, "Synthetic post 0");
+  f.reply(0, 0);
+  f.reply(1, 0);
+  await settle();
+  f.change({ enabled: false });
+  await f.scan();
+  assert.equal(outer.querySelectorAll(".jevlens-analysis").length, 0);
+});
+
+test("Threads scopes fallback text and cleanup to the discovered permalink cards", async () => {
+  const f = fixture({ count: 1, platform: "threads", settings: { actionMode: "mark" } });
+  f.posts[0].remove();
+  const make = (name, caption) => {
+    const card = element("div");
+    const col = element("div");
+    col.append(element("span", { dir: "auto" }, caption), element("a", { href: `/@${name}/post/${name}` }, "Permalink"));
+    card.append(col);
+    return card;
+  };
+  const outer = make("outer", "Short outer fallback caption");
+  const inner = make("quoted", "This is a much longer and independent quoted fallback caption");
+  // The permalink finder climbs at most eight parents. Its two links must
+  // discover different, nested card roots rather than coalescing into one.
+  let branch = inner;
+  for (let i = 0; i < 6; i++) {
+    const wrapper = element("div");
+    wrapper.append(branch);
+    branch = wrapper;
+  }
+  outer.children[0].append(branch);
+  f.attach(outer);
+  f.attach(element("div", {}, "x".repeat(12001)));
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(f.messages[0].features.text, "Short outer fallback caption");
+  assert.equal(f.messages[1].features.text, "This is a much longer and independent quoted fallback caption");
+  f.reply(0, 0);
+  f.reply(1, 0);
+  await settle();
+  f.change({ enabled: false });
+  await f.scan();
+  assert.equal(outer.querySelectorAll(".jevlens-analysis").length, 0);
+});
+
+for (const phase of ["pending", "collapsed", "cloned"]) {
+  test(`a now-ineligible X card retires ${phase} presentation without disturbing its quote`, async () => {
+    const f = fixture({ count: 1 });
+    const original = f.posts[0];
+    await f.scan();
+    if (phase !== "pending") {
+      f.reply(0);
+      await settle();
+      assert.equal(original.classList.contains("jevlens-collapsed"), true);
+    }
+    const card = phase === "cloned" ? cloneCard(original) : original;
+    if (phase === "cloned") f.attach(card);
+    const body = card.querySelector('[data-testid="tweetText"]');
+    const column = body.parentElement;
+    column.append(element("a", { href: "/user0/status/new" }, ""));
+    body.textContent = "?";
+    const quote = nestQuote(card);
+    column.prepend(quote);
+    await f.rescan();
+    assert.equal(f.messages.length, 2);
+    f.reply(1, 0);
+    if (phase === "pending") f.reply(0);
+    await settle();
+    assert.equal(card.classList.contains("jevlens-collapsed"), false);
+    assert.equal(card.querySelector(":scope > .jevlens-reveal"), null);
+    const rows = card.querySelectorAll(".jevlens-analysis");
+    assert.equal(rows.length, 1);
+    assert.equal(quote.contains(rows[0]), true);
+    assert.equal(rows[0].dataset.state, "low");
+  });
+}
+
+for (const copied of [false, true]) {
+  for (const replyBeforeScan of [false, true]) {
+    test(`same-post body replacement recovers a ${copied ? "copied" : "missing"} pending row, reply ${replyBeforeScan ? "before" : "after"} scan`, async () => {
+      const f = fixture({ count: 1, settings: { actionMode: "collapse" } });
+      const card = f.posts[0];
+      await f.scan();
+      const prior = card.querySelector(".jevlens-analysis");
+      const column = cloneCard(card.children[0]);
+      if (!copied) column.querySelector(".jevlens-analysis").remove();
+      card.replaceChildren(column);
+      if (replyBeforeScan) {
+        f.reply(0, 0.9);
+        await settle();
+      }
+      await f.rescan();
+      assert.equal(f.messages.length, 2);
+      assert.equal(card.classList.contains("jevlens-collapsed"), false);
+      const live = card.querySelector(".jevlens-analysis");
+      assert.ok(live && live !== prior);
+      f.reply(1, 0);
+      if (!replyBeforeScan) f.reply(0, 0.9);
+      await settle();
+      await f.rescan();
+      assert.equal(card.querySelectorAll(".jevlens-analysis").length, 1);
+      assert.equal(live.dataset.state, "low");
+      assert.equal(card.classList.contains("jevlens-collapsed"), false);
+      assert.equal(f.messages.length, 2, "a settled live row must not fetch again");
+    });
+  }
+}
+
+for (const mode of ["collapse", "dim"]) {
+  test(`a settled ${mode} survives a same-post row repair and provider error`, async () => {
+    const f = fixture({ count: 1, settings: { actionMode: mode } });
+    const card = f.posts[0];
+    await f.scan();
+    f.reply(0, 0.95);
+    await settle();
+    const css = mode === "collapse" ? "jevlens-collapsed" : "jevlens-dim";
+    assert.equal(card.classList.contains(css), true);
+    const reveal = card.querySelector(":scope > .jevlens-reveal");
+    const originalColumn = card.querySelector('[data-testid="tweetText"]').parentElement;
+    card.insertBefore(cloneCard(originalColumn), originalColumn);
+    originalColumn.remove();
+    await f.rescan();
+    assert.equal(f.messages.length, 2);
+    assert.equal(card.classList.contains(css), true);
+    assert.equal(card.querySelector(":scope > .jevlens-reveal"), reveal);
+    f.messages[1].callback({ ok: false, error: "offline failure" });
+    await settle();
+    assert.equal(card.classList.contains(css), true);
+    assert.equal(card.querySelector(":scope > .jevlens-reveal"), reveal);
+    assert.equal(card.querySelectorAll(".jevlens-analysis").length, 1);
+    if (reveal) {
+      revealPost(card);
+      assert.equal(card.classList.contains(css), false);
+    }
+  });
+}

@@ -4,8 +4,17 @@
   const S = globalThis.JevLensSignals;
 
   let settingsCache = null;
+  let settingsGeneration = 0;
+  let postSerial = 0;
   const queue = [];
-  const queuedKeys = new Set();
+  // Unlike data attributes, this identity is not copied when a feed clones a card.
+  const initializedCards = new WeakSet();
+  const cardMounts = new WeakMap();
+  let pendingWork = new WeakMap();
+  // WeakRefs so an infinite feed can drop detached cards. A strong Set would keep every card
+  // alive until the next settings change. Dead refs are pruned on each scan; a card the page
+  // still holds stays reachable for that toggle.
+  const seenPosts = [];
   let running = 0;
   const MAX_CONCURRENCY = 4;
   const stats = { discovered: 0, queued: 0, analyzed: 0, errors: 0, jev: 0, fallback: 0 };
@@ -26,7 +35,9 @@
 
   async function settings() {
     if (settingsCache) return settingsCache;
+    const generation = settingsGeneration;
     const r = await send({ type: "GET_SETTINGS" });
+    if (generation !== settingsGeneration) return settings();
     settingsCache = r?.settings || {};
     return settingsCache;
   }
@@ -40,15 +51,175 @@
     // Ignore background cache writes; otherwise every classification would trigger a full-feed reanalysis loop.
     if (!syncSettingsChanged && !apiKeyChanged) return;
 
-    settingsCache = null;
-    document.querySelectorAll("[data-jevlens-key]").forEach(el => {
+    settingsGeneration++;
+    const disabled = areaName === "sync" && changes.enabled?.newValue === false;
+    settingsCache = disabled ? { enabled: false } : null;
+    queue.length = 0;
+    pendingWork = new WeakMap();
+    // A settings change is a new decision. A manual reveal does not survive it, including on a
+    // card that is currently detached.
+    visitPosts(el => {
       el.dataset.jevlensDone = "0";
+      delete el.dataset.jevlensReveal;
+      if (disabled) clearPost(el);
     });
+    if (disabled) updateHud();
     scheduleScan(0);
   });
 
+  function extensionChrome(node) {
+    if (!node || node.nodeType === 3) return false;
+    if (node.id === "jevlens-feed-hud") return true;
+    return Boolean(node.classList?.contains("jevlens-analysis") || node.classList?.contains("jevlens-reveal"));
+  }
+
+  function rememberPost(el) {
+    if (!el) return;
+    for (const ref of seenPosts) {
+      if (ref.deref() === el) return;
+    }
+    seenPosts.push(new WeakRef(el));
+  }
+
+  function pruneSeenPosts() {
+    const next = [];
+    const live = new Set();
+    for (const ref of seenPosts) {
+      const el = ref.deref();
+      if (!el || live.has(el)) continue;
+      live.add(el);
+      next.push(ref);
+    }
+    seenPosts.length = 0;
+    seenPosts.push(...next);
+  }
+
+  function visitPosts(fn) {
+    pruneSeenPosts();
+    const seen = new Set();
+    for (const el of document.querySelectorAll("[data-jevlens-key]")) {
+      seen.add(el);
+      fn(el);
+    }
+    const next = [];
+    for (const ref of seenPosts) {
+      const el = ref.deref();
+      if (!el || seen.has(el)) continue;
+      fn(el);
+      if (el.isConnected) next.push(ref);
+    }
+    for (const el of seen) next.push(new WeakRef(el));
+    seenPosts.length = 0;
+    const kept = new Set();
+    for (const ref of next) {
+      const el = ref.deref();
+      if (!el || kept.has(el)) continue;
+      kept.add(el);
+      seenPosts.push(ref);
+    }
+  }
+
+  // While this is positive, the collapse stylesheet is off so getComputedStyle shows the site's
+  // own display. The mutation observer ignores those class flips.
+  let collapseSuspended = 0;
+
+  function withCollapseSuspended(fn) {
+    const root = document.documentElement;
+    collapseSuspended++;
+    const already = root?.classList?.contains("jevlens-suspend-collapse");
+    if (root && !already) root.classList.add("jevlens-suspend-collapse");
+    try {
+      return fn();
+    } finally {
+      collapseSuspended--;
+      if (root && !already) root.classList.remove("jevlens-suspend-collapse");
+    }
+  }
+
+  // Page-hidden copy must not reach the classifier. Callers measure while our collapse rule is
+  // suspended, so a direct child the site itself hides is still display:none, and text hidden
+  // only by JevLens stays visible to this check.
+  function pageHidden(node) {
+    if (!node || node.nodeType === 3) return false;
+    if (node.hidden || node.getAttribute?.("hidden") != null) return true;
+    const declared = inlineVisibility(node.getAttribute?.("style"));
+    let display = "";
+    let visibility = "";
+    let sawComputed = false;
+    try {
+      const style = globalThis.getComputedStyle?.(node);
+      if (style && (style.display || style.visibility)) {
+        display = String(style.display || "");
+        visibility = String(style.visibility || "");
+        sawComputed = true;
+      }
+    } catch {
+      sawComputed = false;
+    }
+    // `display:none; display:block` and `--menu-display:none` are visible. Trust computed style,
+    // and only parse inline CSS when the browser cannot provide it.
+    if (!sawComputed) {
+      display = declared.display;
+      visibility = declared.visibility;
+    }
+    if (visibility === "hidden" || visibility === "collapse") return true;
+    return display === "none";
+  }
+
+  function inlineVisibility(styleText) {
+    let display = "";
+    let visibility = "";
+    for (const decl of String(styleText || "").split(";")) {
+      const splitAt = decl.indexOf(":");
+      if (splitAt < 0) continue;
+      const prop = decl.slice(0, splitAt).trim().toLowerCase();
+      const value = decl.slice(splitAt + 1).trim().toLowerCase().split(/\s+/)[0] || "";
+      if (prop === "display") display = value;
+      else if (prop === "visibility") visibility = value;
+    }
+    return { display, visibility };
+  }
+
+  // text() is also called on a [dir=auto] node directly. Hiding is often on a wrapper, not on
+  // that span, so the check has to walk ancestors. Collapse is suspended before this runs.
+  function concealed(node) {
+    for (let current = node; current; current = current.parentElement) {
+      if (extensionChrome(current) || pageHidden(current)) return true;
+    }
+    return false;
+  }
+
   function text(el) {
-    return (el?.innerText || el?.textContent || "").replace(/\s+/g, " ").trim();
+    return withCollapseSuspended(() => readText(el));
+  }
+
+  function cardText(el, ownsNode) {
+    return withCollapseSuspended(() => readText(el, ownsNode));
+  }
+
+  function readText(el, ownsNode) {
+    if (!el || concealed(el)) return "";
+    const chunks = [];
+    const blocks = new Set(["ADDRESS", "ARTICLE", "BLOCKQUOTE", "DIV", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "P", "SECTION", "TR"]);
+    const walk = node => {
+      if (!node || concealed(node)) return;
+      if (node.nodeType === 3) {
+        chunks.push(node.nodeValue || "");
+        return;
+      }
+      if (node.nodeType && node.nodeType !== 1) return;
+      if (ownsNode && !ownsNode(node)) return;
+      const tag = String(node.tagName || "").toUpperCase();
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "SVG" || tag === "TEMPLATE") return;
+      if (tag === "BR") {
+        chunks.push("\n");
+        return;
+      }
+      for (const child of node.childNodes || []) walk(child);
+      if (blocks.has(tag)) chunks.push("\n");
+    };
+    walk(el);
+    return chunks.join("").replace(/\s+/g, " ").trim();
   }
 
   function simpleHash(value) {
@@ -60,22 +231,42 @@
     return (h >>> 0).toString(36);
   }
 
+  function permalinkId(url) {
+    const match = String(url || "").match(/\/(?:status|post)\/([^/?#]+)/i);
+    return match?.[1] || "";
+  }
+
   function featureKey(features) {
+    // Video layout size changes as metadata arrives. It is not a different post, so it must not
+    // retire a manual reveal. Still images keep their size because a different box can be a different image.
+    // The status id distinguishes two posts that share a card, author, and text.
+    const media = (features.images || []).map(img => (
+      img?.kind === "video_poster"
+        ? [img.url || "", img.alt || ""]
+        : [img.url || "", img.alt || "", img.width || 0, img.height || 0]
+    ));
     return simpleHash([
       features.platform || "",
       features.handle || "",
       features.displayName || "",
       features.text || "",
       features.isReply ? "reply" : "post",
-      JSON.stringify((features.images || []).map(img => [img.url || "", img.alt || "", img.width || 0, img.height || 0]))
+      permalinkId(features.postUrl),
+      JSON.stringify(media)
     ].join("\u241f"));
   }
 
-  function findHandle(root) {
+  function rawHref(link) {
+    if (!link) return "";
+    return link.getAttribute?.("href") || link.href || "";
+  }
+
+  function findHandle(root, ownsNode) {
     if (!root) return "";
-    const anchors = [...root.querySelectorAll('a[href^="/"]')];
+    const anchors = [...root.querySelectorAll('a[href^="/"]')]
+      .filter(anchor => ownsNode(anchor) && !anchor.closest?.(".jevlens-analysis, .jevlens-reveal"));
     for (const a of anchors) {
-      const t = text(a);
+      const t = cardText(a, ownsNode);
       if (/^@[\p{L}\p{N}_.]{1,40}$/u.test(t)) return t;
       const href = a.getAttribute("href") || "";
       const m = href.match(/^\/@([^/?#]+)/);
@@ -83,24 +274,25 @@
         return `@${m[1]}`;
       }
     }
-    const body = text(root);
+    const body = cardText(root, ownsNode);
     const m = body.match(/@[\p{L}\p{N}_.]{1,40}/u);
     return m?.[0] || "";
   }
 
-  function explicitReplySignal(root) {
+  function explicitReplySignal(root, ownsNode) {
     // Do not scan the whole card: social UIs contain reply buttons/accessibility text that can
     // make every feed item look like a reply. Only inspect short author/content text nodes for
     // an explicit relation marker such as “Replying to @foo”.
     const candidates = [...(root?.querySelectorAll?.('[dir="auto"]') || [])]
-      .map(text)
+      .filter(node => ownsNode(node) && !node.closest?.(".jevlens-analysis, .jevlens-reveal"))
+      .map(node => cardText(node, ownsNode))
       .filter(t => t.length > 0 && t.length <= 180)
       .slice(0, 12);
     const relationText = candidates.join("\n");
     return /(?:^|\n)\s*(?:replying to|replied to|正在回覆|回覆給|回覆了|返信先|返信しました)\s*[@＠]?[^\n]{1,80}/i.test(relationText);
   }
 
-  function extractMedia(root) {
+  function extractMedia(root, ownsNode) {
     if (!root) return [];
     const out = [];
     const seen = new Set();
@@ -110,8 +302,9 @@
       if (!/^https?:/i.test(url)) return;
       width = Math.round(Number(width) || 0);
       height = Math.round(Number(height) || 0);
-      // Avoid avatars, emoji and UI icons. Social-media content images are normally much larger.
-      if (width && height && Math.max(width, height) < 140) return;
+      // Avatars and UI icons are small. A video poster is the same video on either side of that
+      // cutoff, so its identity must not depend on the filter.
+      if (kind !== "video_poster" && width && height && Math.max(width, height) < 140) return;
       if (/profile_images|emoji|avatar|profile_pic/i.test(url)) return;
       seen.add(url);
       out.push({
@@ -124,6 +317,7 @@
     };
 
     for (const img of root.querySelectorAll("img")) {
+      if (!ownsNode(img) || img.closest?.(".jevlens-analysis, .jevlens-reveal")) continue;
       const rect = img.getBoundingClientRect?.() || { width: 0, height: 0 };
       add(
         img.currentSrc || img.src || "",
@@ -137,6 +331,7 @@
 
     if (out.length < 4) {
       for (const video of root.querySelectorAll("video[poster]")) {
+        if (!ownsNode(video) || video.closest?.(".jevlens-analysis, .jevlens-reveal")) continue;
         const rect = video.getBoundingClientRect?.() || { width: 0, height: 0 };
         add(video.poster, video.getAttribute("aria-label") || "video poster", rect.width, rect.height, "video_poster");
         if (out.length >= 4) break;
@@ -146,43 +341,45 @@
     return out.slice(0, 4);
   }
 
-  function extractX(article) {
-    const tweet = article.querySelector('[data-testid="tweetText"]');
-    const userName = article.querySelector('[data-testid="User-Name"]');
-    const link = article.querySelector('a[href*="/status/"]');
+  function extractX(article, ownsNode) {
+    const first = selector => [...article.querySelectorAll(selector)].find(ownsNode);
+    const tweet = first('[data-testid="tweetText"]');
+    const userName = first('[data-testid="User-Name"]');
+    const link = first('a[href*="/status/"]');
     return {
       platform: "x",
-      text: text(tweet || article).slice(0, 5000),
-      handle: findHandle(userName || article),
-      displayName: text(userName).split("@")[0].trim().slice(0, 100),
+      text: cardText(tweet || article, ownsNode).slice(0, 5000),
+      handle: findHandle(userName || article, ownsNode),
+      displayName: cardText(userName, ownsNode).split("@")[0].trim().slice(0, 100),
       // A /status/ page can contain both the root post and replies, so URL alone is not a reply signal.
-      isReply: explicitReplySignal(article),
-      postUrl: link?.href || "",
-      images: extractMedia(article)
+      isReply: explicitReplySignal(article, ownsNode),
+      postUrl: rawHref(link),
+      images: extractMedia(article, ownsNode)
     };
   }
 
-  function extractThreads(article) {
+  function extractThreads(article, ownsNode) {
     const candidates = [...article.querySelectorAll('[dir="auto"]')]
-      .map(text)
+      .filter(ownsNode)
+      .map(node => cardText(node, ownsNode))
       .filter(t => t.length >= 2 && t.length <= 5000);
 
     const postLink = [...article.querySelectorAll('a[href*="/post/"]')]
-      .find(a => /\/post\//.test(a.getAttribute("href") || ""));
+      .find(a => ownsNode(a) && /\/post\//.test(a.getAttribute("href") || ""));
 
     const body = candidates
       .filter(t => !/^@[\w.]+$/.test(t))
-      .sort((a, b) => b.length - a.length)[0] || text(article);
+      .sort((a, b) => b.length - a.length)[0] || cardText(article, ownsNode);
 
     return {
       platform: "threads",
       text: body.slice(0, 5000),
-      handle: findHandle(article),
+      handle: findHandle(article, ownsNode),
       displayName: candidates.find(t => t.length < 80 && !t.startsWith("@")) || "",
       // Threads permalink pages also contain the root post; do not treat the whole page as a reply.
-      isReply: explicitReplySignal(article),
-      postUrl: postLink?.href || "",
-      images: extractMedia(article)
+      isReply: explicitReplySignal(article, ownsNode),
+      postUrl: rawHref(postLink),
+      images: extractMedia(article, ownsNode)
     };
   }
 
@@ -212,21 +409,31 @@
   function targetElements() {
     const host = location.hostname.toLowerCase();
 
+    let nodes;
+    let extract;
     if (host === "x.com" || host.endsWith(".x.com") || host === "twitter.com" || host.endsWith(".twitter.com")) {
-      return [...document.querySelectorAll('article[data-testid="tweet"]')]
-        .map(el => ({ el, features: extractX(el) }))
-        .filter(item => item.features.text.length >= 2);
-    }
-
-    if (host === "threads.com" || host.endsWith(".threads.com") || host === "threads.net" || host.endsWith(".threads.net")) {
-      let nodes = [...document.querySelectorAll('article, [role="article"]')];
+      nodes = document.querySelectorAll('article[data-testid="tweet"]');
+      extract = extractX;
+    } else if (host === "threads.com" || host.endsWith(".threads.com") || host === "threads.net" || host.endsWith(".threads.net")) {
+      nodes = document.querySelectorAll('article, [role="article"]');
       if (!nodes.length) nodes = findThreadsFallbackContainers();
-      return [...new Set(nodes)]
-        .map(el => ({ el, features: extractThreads(el) }))
-        .filter(item => item.features.text.length >= 2);
+      extract = extractThreads;
+    } else {
+      return [];
     }
 
-    return [];
+    // Use the same discovered boundaries for extraction and mounting, even
+    // when a Threads card is inferred from a permalink rather than a tag.
+    const roots = new Set(nodes);
+    return [...roots].map(el => {
+      const ownsNode = node => {
+        for (let current = node; current; current = current.parentElement) {
+          if (roots.has(current)) return current === el;
+        }
+        return false;
+      };
+      return { el, features: extract(el, ownsNode), ownsNode };
+    });
   }
 
   const {
@@ -257,23 +464,56 @@
     const status = hud.querySelector(".jevlens-hud-status");
     if (!status) return;
     const active = running + queue.length;
-    status.textContent = extra || `已分析 ${stats.analyzed} · 排隊 ${active} · 錯誤 ${stats.errors}`;
-    hud.dataset.state = stats.errors ? "warning" : active ? "working" : "ready";
+    const disabled = settingsCache?.enabled === false;
+    status.textContent = disabled ? "已停用" : extra || `已分析 ${stats.analyzed} · 排隊 ${active} · 錯誤 ${stats.errors}`;
+    hud.dataset.state = disabled ? "ready" : stats.errors ? "warning" : active ? "working" : "ready";
   }
 
-  function analysisMount(el, platform, features) {
-    let mount = el.querySelector(':scope > .jevlens-analysis, .jevlens-analysis[data-owner="jevlens"]');
-    if (mount) return mount;
+  function postId(el) {
+    if (!el.dataset.jevlensPost) el.dataset.jevlensPost = String(++postSerial);
+    return el.dataset.jevlensPost;
+  }
+
+  function mountIsLive(el, mount) {
+    return Boolean(mount?.isConnected && mount.closest("[data-jevlens-post]") === el);
+  }
+
+  // A quoted or embedded post is a descendant of the outer card and has its own analysis row.
+  // Ownership is recorded on the row so outer cleanup cannot adopt or delete the inner one.
+  function ownAnalysis(el) {
+    const id = el.dataset.jevlensPost;
+    if (!id) return null;
+    for (const node of el.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]')) {
+      if (node.dataset.jevlensOwner === id && node.closest("[data-jevlens-post]") === el) return node;
+    }
+    return null;
+  }
+
+  function removeOwnAnalysis(el) {
+    cardMounts.delete(el);
+    const id = el.dataset.jevlensPost;
+    if (!id) return;
+    for (const node of [...el.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]')]) {
+      if (node.dataset.jevlensOwner === id && node.closest("[data-jevlens-post]") === el) node.remove();
+    }
+  }
+
+  function analysisMount(el, platform, features, ownsNode) {
+    const id = postId(el);
+    let mount = cardMounts.get(el);
+    if (mountIsLive(el, mount)) return mount;
 
     mount = document.createElement("div");
     mount.className = "jevlens-analysis";
     mount.dataset.owner = "jevlens";
+    mount.dataset.jevlensOwner = id;
     mount.dataset.state = "pending";
     mount.innerHTML = '<span class="jevlens-spinner" aria-hidden="true"></span><span class="jevlens-analysis-text">Jev · 排隊中…</span>';
 
     // Mount inside the column that owns the post body. Prepending to the card itself can land the
     // row next to the avatar column, which pushes the post sideways and breaks the feed layout.
-    mount.dataset.mount = S.mountInto(el, mount, platform, features);
+    mount.dataset.mount = S.mountInto(el, mount, platform, features, ownsNode);
+    cardMounts.set(el, mount);
     return mount;
   }
 
@@ -376,10 +616,15 @@
 
     const show = document.createElement("button");
     show.textContent = "顯示";
+    show.dataset.jevlensGeneration = String(settingsGeneration);
     show.onclick = () => {
+      // The button is from a previous blocklist. A click while settings reload must not record a
+      // reveal, or the next scan treats the card as finished and never classifies it.
+      if (show.dataset.jevlensGeneration !== String(settingsGeneration)) return;
       el.classList.remove("jevlens-collapsed");
       reveal.remove();
       delete el.dataset.jevlensCollapse;
+      if (el.dataset.jevlensKey) el.dataset.jevlensReveal = el.dataset.jevlensKey;
     };
     reveal.appendChild(show);
 
@@ -408,30 +653,54 @@
     delete el.dataset.jevlensCollapse;
   }
 
+  function clearPost(el) {
+    releasePostState(el);
+    removeOwnAnalysis(el);
+  }
+
+  function retireCard(el) {
+    pendingWork.delete(el);
+    clearPost(el);
+    delete el.dataset.jevlensPost;
+    delete el.dataset.jevlensKey;
+    delete el.dataset.jevlensDone;
+    delete el.dataset.jevlensReveal;
+    delete el.dataset.jevlensWork; // Remove the old marker on an already annotated clone.
+  }
+
   async function runItem(item) {
     running++;
     updateHud();
-    const { el, features, key, mount } = item;
+    const { el, features, key, mount, generation, workId } = item;
+    const ownsCard = () => pendingWork.get(el) === workId;
+    const isCurrent = () =>
+      generation === settingsGeneration && el.isConnected && el.dataset.jevlensKey === key && ownsCard()
+      && cardMounts.get(el) === mount && mountIsLive(el, mount);
 
     try {
-      if (!el.isConnected || el.dataset.jevlensKey !== key) return;
+      if (!isCurrent()) return;
 
       const s = await settings();
+      if (!isCurrent()) return;
       if (!s.enabled) {
-        mount.remove();
+        clearPost(el);
         return;
       }
 
       const blocked = (s.localBlockedHandles || []).map(x => x.toLowerCase());
       if (features.handle && blocked.includes(features.handle.toLowerCase())) {
-        collapse(el, `JevLens 本機封鎖：${features.handle}`);
+        const revealed = el.dataset.jevlensReveal === key;
+        clearPost(el);
+        if (!revealed) collapse(el, `JevLens 本機封鎖：${features.handle}`);
+        // Local block needs no classifier call. A stored reveal stays visible for this post version.
+        el.dataset.jevlensDone = "1";
         return;
       }
 
       setPending(mount);
       const reply = await send({ type: "CLASSIFY", kind: "social", features });
 
-      if (!el.isConnected || el.dataset.jevlensKey !== key) return;
+      if (!isCurrent()) return;
 
       if (!reply?.ok) {
         stats.errors++;
@@ -448,11 +717,14 @@
       else stats.fallback++;
 
       const presentation = riskPresentation(maxRisk, s);
+      const revealed = el.dataset.jevlensReveal === key;
       // Release first, then apply: the new classification owns the post's presentation state.
+      // A manual reveal of this same post version stays open.
       releasePostState(el);
-      if (presentation.dim) el.classList.add("jevlens-dim");
-      if (presentation.collapse) collapse(el, `JevLens 摺疊：風險 ${pct(maxRisk)}`, features.handle);
+      if (!revealed && presentation.dim) el.classList.add("jevlens-dim");
+      if (!revealed && presentation.collapse) collapse(el, `JevLens 摺疊：風險 ${pct(maxRisk)}`, features.handle);
     } catch (err) {
+      if (!isCurrent()) return;
       stats.errors++;
       if (mount?.isConnected) {
         renderError(mount, err?.message || String(err));
@@ -460,7 +732,8 @@
       }
     } finally {
       running--;
-      queuedKeys.delete(key);
+      // A newer decision can already own the same element. Retire only this item.
+      if (ownsCard()) pendingWork.delete(el);
       pump();
       updateHud();
     }
@@ -473,36 +746,75 @@
     }
   }
 
-  function enqueue(el, features) {
+  function enqueue(el, features, ownsNode) {
     const key = featureKey(features);
+    if (!initializedCards.has(el)) {
+      // A cloned card can inherit a pending row, a completed decision, or a collapse button.
+      // Remove only the clone's own analysis before assigning it a new post identity.
+      retireCard(el);
+      initializedCards.add(el);
+    }
+    rememberPost(el);
+    const currentMount = cardMounts.get(el);
+    if (currentMount && !mountIsLive(el, currentMount)) {
+      // The card element survived, but the page replaced its contents.
+      // Discard a copied row rather than trusting its cloned data attributes.
+      pendingWork.delete(el);
+      // Preserve the accepted dim/collapse and a working reveal on the
+      // same post until a new decision succeeds. Key changes still clear it.
+      removeOwnAnalysis(el);
+      el.dataset.jevlensDone = "0";
+    }
+    if (el.dataset.jevlensKey && el.dataset.jevlensKey !== key) {
+      delete el.dataset.jevlensReveal;
+      // A recycled card still carries the previous post's 顯示 button until the new decision lands.
+      releasePostState(el);
+      pendingWork.delete(el);
+    }
+    // A reveal is not classification. Done stays whatever the last real decision set, so a stale
+    // 顯示 click cannot mark an unblocked card finished.
     if (el.dataset.jevlensKey === key && ["1", "error"].includes(el.dataset.jevlensDone)) return;
-    if (queuedKeys.has(key) && el.dataset.jevlensKey === key) return;
+    if (el.dataset.jevlensKey === key && pendingWork.has(el)) return;
 
-    const old = el.querySelector('.jevlens-analysis[data-owner="jevlens"]');
+    const old = ownAnalysis(el);
     if (old && el.dataset.jevlensKey !== key) old.remove();
 
+    const workId = Symbol();
     el.dataset.jevlensKey = key;
     el.dataset.jevlensDone = "0";
-    const mount = analysisMount(el, features.platform, features);
+    const mount = analysisMount(el, features.platform, features, ownsNode);
     setPending(mount, "Jev · 排隊中…");
 
-    queuedKeys.add(key);
-    queue.push({ el, features, key, mount });
+    pendingWork.set(el, workId);
+    queue.push({ el, features, key, mount, generation: settingsGeneration, workId });
     stats.queued++;
     pump();
   }
 
   async function scan() {
+    pruneSeenPosts();
+    const generation = settingsGeneration;
     const s = await settings();
+    if (generation !== settingsGeneration) return;
     if (!s.enabled) {
+      visitPosts(clearPost);
       updateHud("已停用");
       return;
     }
 
     const targets = targetElements();
-    stats.discovered = targets.length;
-    for (const item of targets) enqueue(item.el, item.features);
-    updateHud(targets.length ? "" : "等待可分析貼文…");
+    stats.discovered = 0;
+    for (const { el, features, ownsNode } of targets) {
+      if (features.text.length < 2) {
+        // Site reuse can leave a card too short to analyze while it still
+        // has pending work or carries a copied decision from another card.
+        if (el.dataset.jevlensPost || el.dataset.jevlensKey || pendingWork.has(el)) retireCard(el);
+        continue;
+      }
+      stats.discovered++;
+      enqueue(el, features, ownsNode);
+    }
+    updateHud(stats.discovered ? "" : "等待可分析貼文…");
   }
 
   let scanTimer = 0;
@@ -514,7 +826,10 @@
     }), delay);
   }
 
-  const observer = new MutationObserver(() => scheduleScan(120));
+  const observer = new MutationObserver(() => {
+    if (collapseSuspended) return;
+    scheduleScan(120);
+  });
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
   // SPA soft navigation does not reinject MV3 content scripts. Watch URL changes explicitly.

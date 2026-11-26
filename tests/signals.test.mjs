@@ -32,6 +32,7 @@ function el(tag, options = {}) {
   };
   node.insertBefore = (child, ref) => {
     const index = ref ? node.children.indexOf(ref) : -1;
+    if (ref != null && index < 0) throw new DOMException("Reference is not a child", "NotFoundError");
     if (index < 0) return node.appendChild(child);
     child.parentElement = node;
     node.children.splice(index, 0, child);
@@ -238,6 +239,7 @@ test("inline wrappers are skipped so the row never lands inside a link", () => {
   const mount = el("div");
   assert.equal(S.mountInto(article, mount, "threads", { text: "長文本" }), "column");
   assert.equal(mount.parentElement, column);
+  assert.deepEqual(column.children, [mount, anchor]);
 });
 
 test("x row mounts directly above the tweet text", () => {
@@ -274,3 +276,25 @@ test("post text blocks already injected by JevLens are ignored when re-mounting"
   assert.equal(S.mountInto(article, mount, "threads", { text: "真正的貼文" }), "column");
   assert.equal(mount.parentElement, column);
 });
+
+for (const platform of ["threads", "x"]) {
+  test(platform + " nested inline wrappers mount before their direct column child", () => {
+    const article = el("article");
+    const header = el("div", { text: "header" });
+    const column = el("div", { display: "flex" });
+    const outer = el("span", { display: "inline-block" });
+    const inner = el("a", { display: "inline" });
+    const body = el("span", { display: "inline", text: "body text",
+      attributes: platform === "x" ? { "data-testid": "tweetText" } : { dir: "auto" } });
+    inner.appendChild(body);
+    outer.appendChild(inner);
+    column.appendChild(header);
+    column.appendChild(outer);
+    article.appendChild(column);
+    const mount = el("div");
+    assert.equal(S.mountInto(article, mount, platform, { text: "body text" }), "column");
+    assert.deepEqual(column.children, [header, mount, outer]);
+    assert.equal(inner.children[0], body);
+    assert.equal(outer.children[0], inner);
+  });
+}
