@@ -57,7 +57,7 @@ function element(tag, attributes = {}, value = "") {
       return false;
     },
     closest(selector) {
-      for (let n = this; n; n = n.parentElement) if (matches(n, selector)) return n;
+      for (let n = this; n; n = n.parentElement) if (selector.split(",").some(s => matches(n, s.trim()))) return n;
       return null;
     },
     querySelectorAll(selector) {
@@ -755,3 +755,188 @@ test("recycling one card does not clear the identical sibling's pending classifi
   assert.equal(f.posts[1].dataset.jevlensDone, "1");
   assert.equal(f.posts[0].dataset.jevlensDone, "1");
 });
+
+function cloneCard(node) {
+  const clone = element(node.tagName, { ...node.attributes }, node.ownText);
+  clone.dataset = { ...node.dataset };
+  clone.className = node.className;
+  clone.append(...node.children.map(cloneCard));
+  return clone;
+}
+
+test("a clone of a pending card receives independent work", async () => {
+  const f = fixture({ count: 1 });
+  await f.scan();
+  const clone = cloneCard(f.posts[0]);
+  f.attach(clone);
+  await f.rescan();
+  assert.equal(f.messages.length, 2);
+  assert.notEqual(clone.dataset.jevlensPost, f.posts[0].dataset.jevlensPost);
+  assert.equal(clone.querySelectorAll(".jevlens-analysis").length, 1);
+  f.reply(0, 0);
+  f.reply(1, 0);
+  await settle();
+  assert.equal(clone.dataset.jevlensDone, "1");
+});
+
+test("an already analyzed clone does not inherit the original decision", async () => {
+  const f = fixture({ count: 1, actionMode: "collapse" });
+  await f.scan();
+  f.reply(0);
+  await settle();
+  const original = f.posts[0];
+  const clone = cloneCard(original);
+  f.attach(clone);
+  await f.rescan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(clone.classList.contains("jevlens-collapsed"), false);
+  assert.equal(clone.querySelectorAll(".jevlens-analysis").length, 1);
+  assert.equal(original.dataset.jevlensDone, "1");
+});
+
+for (const completed of [false, true]) {
+  test(`a deep clone preserves its genuine nested card's ${completed ? "completed" : "pending"} analysis`, async () => {
+    const f = fixture({ count: 1, settings: { actionMode: "mark" } });
+    await f.scan();
+    const original = f.posts[0];
+    const copied = cloneCard(original);
+    copied.querySelector('[data-testid="tweetText"]').textContent = "Distinct outer body";
+    copied.querySelector('[data-testid="User-Name"]').textContent = "@outer-copy";
+    const originalRow = original.querySelector(".jevlens-analysis");
+    if (completed) {
+      f.reply(0, 0);
+      await settle();
+    }
+    copied.children[0].append(original);
+    f.attach(copied);
+    await f.rescan();
+    assert.equal(f.messages.length, 2);
+    f.reply(1, 0);
+    if (!completed) f.reply(0, 0.9);
+    await settle();
+    await f.rescan();
+    const own = card => card.querySelectorAll(".jevlens-analysis")
+      .filter(row => row.closest("[data-jevlens-post]") === card);
+    assert.deepEqual(own(original), [originalRow]);
+    assert.equal(own(copied).length, 1);
+    assert.equal(own(copied)[0].dataset.state, "low");
+    assert.equal(originalRow.dataset.state, completed ? "low" : "high");
+  });
+}
+
+for (const duplicate of [false, true]) {
+  test(`Threads disables and restores each nested badge once${duplicate ? " for a deep clone" : ""}`, async () => {
+    const f = fixture({ count: 1, platform: "threads", settings: { actionMode: "mark" } });
+    const outer = f.posts[0];
+    outer.querySelector('[data-testid="tweetText"]').textContent = "Short caption";
+    const nested = nestQuote(outer);
+    nested.querySelector('[data-testid="tweetText"]').setAttribute("dir", "auto");
+    nested.querySelector('[data-testid="tweetText"]').textContent = "Distinct longer quoted post, not the outer caption";
+    const cards = [outer];
+    if (duplicate) {
+      const copy = cloneCard(outer);
+      f.attach(copy);
+      cards.push(copy);
+    }
+    const rows = () => cards.reduce((n, c) => n + c.querySelectorAll(".jevlens-analysis").length, 0);
+    await f.scan();
+    const count = duplicate ? 4 : 2;
+    assert.equal(f.messages.length, count);
+    for (let i = 0; i < count; i++) f.reply(i, 0);
+    await settle();
+    assert.equal(rows(), count);
+    f.change({ enabled: false });
+    await f.scan();
+    assert.equal(rows(), 0, "disable must remove every badge");
+    f.change({ enabled: true });
+    await f.scan();
+    for (let i = count; i < count * 2; i++) f.reply(i, 0);
+    await settle();
+    assert.equal(rows(), count);
+    assert.equal(f.messages[0].features.text, "Short caption");
+    assert.equal(f.messages[1].features.text, "Distinct longer quoted post, not the outer caption");
+  });
+}
+
+test("X keeps its own post text when a quoted card comes first", async () => {
+  const f = fixture({ count: 1, settings: { actionMode: "mark" } });
+  const outer = f.posts[0];
+  const nested = nestQuote(outer);
+  outer.children[0].prepend(nested);
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(f.messages[0].features.text, "Synthetic post 0");
+  f.reply(0, 0);
+  f.reply(1, 0);
+  await settle();
+  f.change({ enabled: false });
+  await f.scan();
+  assert.equal(outer.querySelectorAll(".jevlens-analysis").length, 0);
+});
+
+test("Threads scopes fallback text and cleanup to the discovered permalink cards", async () => {
+  const f = fixture({ count: 1, platform: "threads", settings: { actionMode: "mark" } });
+  f.posts[0].remove();
+  const make = (name, caption) => {
+    const card = element("div");
+    const col = element("div");
+    col.append(element("span", { dir: "auto" }, caption), element("a", { href: `/@${name}/post/${name}` }, "Permalink"));
+    card.append(col);
+    return card;
+  };
+  const outer = make("outer", "Short outer fallback caption");
+  const inner = make("quoted", "This is a much longer and independent quoted fallback caption");
+  // The permalink finder climbs at most eight parents. Its two links must
+  // discover different, nested card roots rather than coalescing into one.
+  let branch = inner;
+  for (let i = 0; i < 6; i++) {
+    const wrapper = element("div");
+    wrapper.append(branch);
+    branch = wrapper;
+  }
+  outer.children[0].append(branch);
+  f.attach(outer);
+  f.attach(element("div", {}, "x".repeat(12001)));
+  await f.scan();
+  assert.equal(f.messages.length, 2);
+  assert.equal(f.messages[0].features.text, "Short outer fallback caption");
+  assert.equal(f.messages[1].features.text, "This is a much longer and independent quoted fallback caption");
+  f.reply(0, 0);
+  f.reply(1, 0);
+  await settle();
+  f.change({ enabled: false });
+  await f.scan();
+  assert.equal(outer.querySelectorAll(".jevlens-analysis").length, 0);
+});
+
+for (const phase of ["pending", "collapsed", "cloned"]) {
+  test(`a now-ineligible X card retires ${phase} presentation without disturbing its quote`, async () => {
+    const f = fixture({ count: 1 });
+    const original = f.posts[0];
+    await f.scan();
+    if (phase !== "pending") {
+      f.reply(0);
+      await settle();
+      assert.equal(original.classList.contains("jevlens-collapsed"), true);
+    }
+    const card = phase === "cloned" ? cloneCard(original) : original;
+    if (phase === "cloned") f.attach(card);
+    const body = card.querySelector('[data-testid="tweetText"]');
+    const column = body.parentElement;
+    column.append(element("a", { href: "/user0/status/new" }, ""));
+    body.textContent = "?";
+    const quote = nestQuote(card);
+    column.prepend(quote);
+    await f.rescan();
+    assert.equal(f.messages.length, 2);
+    f.reply(1, 0);
+    if (phase === "pending") f.reply(0);
+    await settle();
+    assert.equal(card.classList.contains("jevlens-collapsed"), false);
+    assert.equal(card.querySelector(":scope > .jevlens-reveal"), null);
+    const rows = card.querySelectorAll(".jevlens-analysis");
+    assert.equal(rows.length, 1);
+    assert.equal(quote.contains(rows[0]), true);
+    assert.equal(rows[0].dataset.state, "low");
+  });
+}

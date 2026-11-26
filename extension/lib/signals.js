@@ -209,13 +209,13 @@
     return (node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
   }
 
-  function postTextNode(el, platform, features) {
+  function postTextNode(el, platform, features, ownsNode = () => true) {
     if (!el) return null;
-    if (platform === "x") return el.querySelector('[data-testid="tweetText"]');
+    if (platform === "x") return [...el.querySelectorAll('[data-testid="tweetText"]')].find(ownsNode) || null;
 
     const wanted = (features?.text || "").trim();
     const blocks = [...el.querySelectorAll('[dir="auto"]')]
-      .filter(node => !node.closest?.(".jevlens-analysis"));
+      .filter(node => ownsNode(node) && !node.closest?.(".jevlens-analysis"));
     if (!blocks.length) return null;
 
     if (wanted) {
@@ -242,8 +242,8 @@
     return null;
   }
 
-  function mountInto(el, mount, platform, features) {
-    const textNode = postTextNode(el, platform, features);
+  function mountInto(el, mount, platform, features, ownsNode = () => true) {
+    const textNode = postTextNode(el, platform, features, ownsNode);
     const column = mountColumn(el, textNode);
 
     if (column && textNode && column.contains?.(textNode)) {
@@ -255,7 +255,7 @@
     }
 
     if (platform === "x") {
-      const user = el.querySelector('[data-testid="User-Name"]');
+      const user = [...el.querySelectorAll('[data-testid="User-Name"]')].find(ownsNode);
       if (user?.parentElement) {
         user.parentElement.insertBefore(mount, user.nextSibling);
         return "header";

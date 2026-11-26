@@ -24,7 +24,7 @@ test("classifier cache includes a schema version", () => {
 
 test("social extraction and background pipeline include image analysis", () => {
   assert.match(content, /function extractMedia/);
-  assert.match(content, /images:\s*extractMedia\(article\)/);
+  assert.match(content, /images:\s*extractMedia\(article, ownsNode\)/);
   assert.match(signals, /成人內容/);
   assert.match(background, /ANALYZE_IMAGES/);
   assert.match(background, /imageAnalysisEnabled/);
@@ -38,7 +38,7 @@ test("the feed row renders only the highest-scoring categories", () => {
 });
 
 test("the feed row is mounted inside the post text column", () => {
-  assert.match(content, /mountInto\(el, mount, platform, features\)/);
+  assert.match(content, /mountInto\(el, mount, platform, features, ownsNode\)/);
   assert.match(signals, /function mountInto/);
   assert.doesNotMatch(content, /insertAdjacentElement\("afterend", mount\)/);
 });
