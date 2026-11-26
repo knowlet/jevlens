@@ -940,3 +940,63 @@ for (const phase of ["pending", "collapsed", "cloned"]) {
     assert.equal(rows[0].dataset.state, "low");
   });
 }
+
+for (const copied of [false, true]) {
+  for (const replyBeforeScan of [false, true]) {
+    test(`same-post body replacement recovers a ${copied ? "copied" : "missing"} pending row, reply ${replyBeforeScan ? "before" : "after"} scan`, async () => {
+      const f = fixture({ count: 1, settings: { actionMode: "collapse" } });
+      const card = f.posts[0];
+      await f.scan();
+      const prior = card.querySelector(".jevlens-analysis");
+      const column = cloneCard(card.children[0]);
+      if (!copied) column.querySelector(".jevlens-analysis").remove();
+      card.replaceChildren(column);
+      if (replyBeforeScan) {
+        f.reply(0, 0.9);
+        await settle();
+      }
+      await f.rescan();
+      assert.equal(f.messages.length, 2);
+      assert.equal(card.classList.contains("jevlens-collapsed"), false);
+      const live = card.querySelector(".jevlens-analysis");
+      assert.ok(live && live !== prior);
+      f.reply(1, 0);
+      if (!replyBeforeScan) f.reply(0, 0.9);
+      await settle();
+      await f.rescan();
+      assert.equal(card.querySelectorAll(".jevlens-analysis").length, 1);
+      assert.equal(live.dataset.state, "low");
+      assert.equal(card.classList.contains("jevlens-collapsed"), false);
+      assert.equal(f.messages.length, 2, "a settled live row must not fetch again");
+    });
+  }
+}
+
+for (const mode of ["collapse", "dim"]) {
+  test(`a settled ${mode} survives a same-post row repair and provider error`, async () => {
+    const f = fixture({ count: 1, settings: { actionMode: mode } });
+    const card = f.posts[0];
+    await f.scan();
+    f.reply(0, 0.95);
+    await settle();
+    const css = mode === "collapse" ? "jevlens-collapsed" : "jevlens-dim";
+    assert.equal(card.classList.contains(css), true);
+    const reveal = card.querySelector(":scope > .jevlens-reveal");
+    const originalColumn = card.querySelector('[data-testid="tweetText"]').parentElement;
+    card.insertBefore(cloneCard(originalColumn), originalColumn);
+    originalColumn.remove();
+    await f.rescan();
+    assert.equal(f.messages.length, 2);
+    assert.equal(card.classList.contains(css), true);
+    assert.equal(card.querySelector(":scope > .jevlens-reveal"), reveal);
+    f.messages[1].callback({ ok: false, error: "offline failure" });
+    await settle();
+    assert.equal(card.classList.contains(css), true);
+    assert.equal(card.querySelector(":scope > .jevlens-reveal"), reveal);
+    assert.equal(card.querySelectorAll(".jevlens-analysis").length, 1);
+    if (reveal) {
+      revealPost(card);
+      assert.equal(card.classList.contains(css), false);
+    }
+  });
+}

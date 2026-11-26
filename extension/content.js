@@ -9,6 +9,7 @@
   const queue = [];
   // Unlike data attributes, this identity is not copied when a feed clones a card.
   const initializedCards = new WeakSet();
+  const cardMounts = new WeakMap();
   let pendingWork = new WeakMap();
   // WeakRefs so an infinite feed can drop detached cards. A strong Set would keep every card
   // alive until the next settings change. Dead refs are pruned on each scan; a card the page
@@ -473,6 +474,10 @@
     return el.dataset.jevlensPost;
   }
 
+  function mountIsLive(el, mount) {
+    return Boolean(mount?.isConnected && mount.closest("[data-jevlens-post]") === el);
+  }
+
   // A quoted or embedded post is a descendant of the outer card and has its own analysis row.
   // Ownership is recorded on the row so outer cleanup cannot adopt or delete the inner one.
   function ownAnalysis(el) {
@@ -485,6 +490,7 @@
   }
 
   function removeOwnAnalysis(el) {
+    cardMounts.delete(el);
     const id = el.dataset.jevlensPost;
     if (!id) return;
     for (const node of [...el.querySelectorAll('.jevlens-analysis[data-owner="jevlens"]')]) {
@@ -494,8 +500,8 @@
 
   function analysisMount(el, platform, features, ownsNode) {
     const id = postId(el);
-    let mount = ownAnalysis(el);
-    if (mount) return mount;
+    let mount = cardMounts.get(el);
+    if (mountIsLive(el, mount)) return mount;
 
     mount = document.createElement("div");
     mount.className = "jevlens-analysis";
@@ -507,6 +513,7 @@
     // Mount inside the column that owns the post body. Prepending to the card itself can land the
     // row next to the avatar column, which pushes the post sideways and breaks the feed layout.
     mount.dataset.mount = S.mountInto(el, mount, platform, features, ownsNode);
+    cardMounts.set(el, mount);
     return mount;
   }
 
@@ -666,7 +673,9 @@
     updateHud();
     const { el, features, key, mount, generation, workId } = item;
     const ownsCard = () => pendingWork.get(el) === workId;
-    const isCurrent = () => generation === settingsGeneration && el.isConnected && el.dataset.jevlensKey === key && ownsCard();
+    const isCurrent = () =>
+      generation === settingsGeneration && el.isConnected && el.dataset.jevlensKey === key && ownsCard()
+      && cardMounts.get(el) === mount && mountIsLive(el, mount);
 
     try {
       if (!isCurrent()) return;
@@ -746,6 +755,16 @@
       initializedCards.add(el);
     }
     rememberPost(el);
+    const currentMount = cardMounts.get(el);
+    if (currentMount && !mountIsLive(el, currentMount)) {
+      // The card element survived, but the page replaced its contents.
+      // Discard a copied row rather than trusting its cloned data attributes.
+      pendingWork.delete(el);
+      // Preserve the accepted dim/collapse and a working reveal on the
+      // same post until a new decision succeeds. Key changes still clear it.
+      removeOwnAnalysis(el);
+      el.dataset.jevlensDone = "0";
+    }
     if (el.dataset.jevlensKey && el.dataset.jevlensKey !== key) {
       delete el.dataset.jevlensReveal;
       // A recycled card still carries the previous post's 顯示 button until the new decision lands.
